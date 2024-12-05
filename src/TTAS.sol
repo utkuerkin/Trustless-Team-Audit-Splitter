@@ -15,7 +15,8 @@ contract TTAS {
     /*//////////////////////////////////////////////////////////////
                                  TYPES
     //////////////////////////////////////////////////////////////*/
-
+    /// @notice Mapping to track if an address is a member
+    mapping(address => bool) private _isMember;
     /// @notice Member structure to track shares and released tokens
     struct Member {
         uint256 shares;
@@ -32,22 +33,22 @@ contract TTAS {
         mapping(address => uint256) owedAmount;    // Amount owed to each member
     }
 
-    /// @notice Proposal structure for governance actions
-    struct Proposal {
-        ProposalType proposalType;
-        address targetAddress;     // New member address for ADD_MEMBER
-        uint256[] newShares;      // New share amounts for all members (including new member)
-        address[] memberAddresses; // All member addresses (including new member)
-        uint256 votesFor;
-        uint256 votesAgainst;
-        bool executed;
-        mapping(address => bool) hasVoted;
-    }
-
     /// @notice Types of proposals that can be created
     enum ProposalType {
         ADD_MEMBER,
         UPDATE_SHARES
+    }
+
+    /// @notice Proposal structure for governance actions
+    struct Proposal {
+        ProposalType proposalType;
+        address newMember;           // Only used for ADD_MEMBER proposals
+        address[] memberAddresses;   // Member addresses for share distribution
+        uint256[] newShares;        // New share amounts
+        uint256 votesFor;
+        uint256 votesAgainst;
+        bool executed;
+        mapping(address => bool) hasVoted;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -100,6 +101,7 @@ contract TTAS {
         // Initialize members with their shares
         for (uint256 i = 0; i < initialMembers.length; i++) {
             _addMember(initialMembers[i], initialShares[i]);
+            _isMember[initialMembers[i]] = true;
         }
     }
 
@@ -138,45 +140,24 @@ contract TTAS {
         emit PaymentReleased(token, msg.sender, totalOwed);
     }
 
-    /// @notice Creates a new proposal for adding a member or updating shares
-    /// @param _type Type of proposal (ADD_MEMBER or UPDATE_SHARES)
-    /// @param _targetAddress Address of the member to add (if ADD_MEMBER)
-    /// @param _memberAddresses Array of member addresses (including new member if ADD_MEMBER)
-    /// @param _newShares Array of new share amounts corresponding to _memberAddresses
-    function createProposal(
-        ProposalType _type,
-        address _targetAddress,
+    /// @notice Creates a proposal for adding a new member
+    /// @param _newMember Address of the member to add
+    /// @param _newShares Array of new share amounts for all members (including new member)
+    /// @param _memberAddresses Array of all member addresses (including new member)
+    function createAddMemberProposal(
+        address _newMember,
         address[] calldata _memberAddresses,
         uint256[] calldata _newShares
     ) external {
         require(shares(msg.sender) > 0, "Not a member");
         require(_memberAddresses.length == _newShares.length, "Length mismatch");
-        
-        // Validate total shares equals 100%
-        uint256 totalNewShares;
-        for(uint256 i = 0; i < _newShares.length; i++) {
-            totalNewShares += _newShares[i];
-        }
-        require(totalNewShares == MAX_TOTAL_SHARES, "Total must be 100%");
-
-        if(_type == ProposalType.ADD_MEMBER) {
-            require(_targetAddress != address(0), "Invalid address");
-            require(_members[_targetAddress].shares == 0, "Already member");
-            // Verify new member is included in the arrays
-            bool found;
-            for(uint256 i = 0; i < _memberAddresses.length; i++) {
-                if(_memberAddresses[i] == _targetAddress) {
-                    found = true;
-                    break;
-                }
-            }
-            require(found, "New member not in array");
-        }
+        require(_newMember != address(0), "Invalid address");
+        require(!_isMember[_newMember], "Already member");
         
         // Create new proposal
         Proposal storage newProposal = proposals[proposalCount];
-        newProposal.proposalType = _type;
-        newProposal.targetAddress = _targetAddress;
+        newProposal.proposalType = ProposalType.ADD_MEMBER;
+        newProposal.newMember = _newMember;
         
         // Store member addresses and new shares
         for(uint256 i = 0; i < _memberAddresses.length; i++) {
@@ -184,7 +165,39 @@ contract TTAS {
             newProposal.newShares.push(_newShares[i]);
         }
         
-        emit ProposalCreated(proposalCount, msg.sender, _type);
+        emit ProposalCreated(proposalCount, msg.sender, ProposalType.ADD_MEMBER);
+        proposalCount++;
+    }
+
+    /// @notice Creates a proposal for updating member shares
+    /// @param _memberAddresses Array of member addresses
+    /// @param _newShares Array of new share amounts
+    function createUpdateSharesProposal(
+        address[] calldata _memberAddresses,
+        uint256[] calldata _newShares
+    ) external {
+        require(shares(msg.sender) > 0, "Not a member");
+        require(_memberAddresses.length == _newShares.length, "Length mismatch");
+        
+        // Validate total shares equals 100%
+        uint256 totalShareAmount;
+        for(uint256 i = 0; i < _newShares.length; i++) {
+            totalShareAmount += _newShares[i];
+        }
+        require(totalShareAmount == MAX_TOTAL_SHARES, "Total shares must equal 100%");
+        
+        // Create new proposal
+        Proposal storage newProposal = proposals[proposalCount];
+        newProposal.proposalType = ProposalType.UPDATE_SHARES;
+        
+        // Store member addresses and new shares
+        for(uint256 i = 0; i < _memberAddresses.length; i++) {
+            require(_isMember[_memberAddresses[i]], "Not a member");
+            newProposal.memberAddresses.push(_memberAddresses[i]);
+            newProposal.newShares.push(_newShares[i]);
+        }
+        
+        emit ProposalCreated(proposalCount, msg.sender, ProposalType.UPDATE_SHARES);
         proposalCount++;
     }
 
@@ -197,7 +210,6 @@ contract TTAS {
         require(!proposal.hasVoted[msg.sender], "Already voted");
         require(!proposal.executed, "Already executed");
         
-        // Record the vote
         proposal.hasVoted[msg.sender] = true;
         
         if (_support) {
@@ -243,7 +255,7 @@ contract TTAS {
         Proposal storage proposal = proposals[proposalId];
         return (
             proposal.proposalType,
-            proposal.targetAddress,
+            proposal.newMember,
             proposal.newShares,
             proposal.memberAddresses,
             proposal.votesFor,
@@ -314,29 +326,26 @@ contract TTAS {
         require(!proposal.executed, "Already executed");
         require(proposal.votesFor == totalShares(), "Insufficient votes");
         
-        if (proposal.proposalType == ProposalType.ADD_MEMBER) {
-            // Validate new member
-            require(proposal.targetAddress != address(0), "Invalid address");
-            require(_members[proposal.targetAddress].shares == 0, "Already member");
-            
-            // Add new member to list
-            _memberList.push(proposal.targetAddress);
-        }
-        
         // Update all shares according to proposal
         _totalShares = 0;
+        
+        if (proposal.proposalType == ProposalType.ADD_MEMBER) {
+            require(!_isMember[proposal.newMember], "Already member");
+            _isMember[proposal.newMember] = true;
+            _memberList.push(proposal.newMember);
+            emit MemberAdded(proposal.newMember, proposal.newShares[proposal.memberAddresses.length - 1]);
+        }
+        
         for(uint256 i = 0; i < proposal.memberAddresses.length; i++) {
             address member = proposal.memberAddresses[i];
             uint256 newShare = proposal.newShares[i];
             
-            if(proposal.proposalType == ProposalType.ADD_MEMBER && member == proposal.targetAddress) {
-                emit MemberAdded(member, newShare);
-            } else {
-                emit SharesUpdated(member, newShare);
-            }
-            
             _members[member].shares = newShare;
             _totalShares += newShare;
+            
+            if(proposal.proposalType == ProposalType.UPDATE_SHARES) {
+                emit SharesUpdated(member, newShare);
+            }
         }
         
         require(_totalShares == MAX_TOTAL_SHARES, "Total shares must equal 100%");
@@ -353,7 +362,7 @@ contract TTAS {
     function _addMember(address account, uint256 shareAmount) private {
         require(account != address(0), "Zero address");
         require(shareAmount > 0, "Zero shares");
-        require(_members[account].shares == 0, "Already member");
+        require(!_isMember[account], "Already member");
         require(_totalShares + shareAmount <= MAX_TOTAL_SHARES, "Exceeds max shares");
 
         _members[account].shares = shareAmount;
