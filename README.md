@@ -1,28 +1,24 @@
-# Trustless Team Audit Splitter
+# Trustless Team Audit Splitter v1
 
 A trustless smart contract system for managing and distributing audit team revenues. This contract enables automatic and transparent distribution of payments based on team member shares.
 
 ## Features
 
 - 🔒 Trustless revenue distribution
-- 👥 Democratic share management through voting
 - 📊 Transparent payment tracking and history
-- 🗳️ On-chain governance for team changes
 - 💰 Support for any ERC20 token payments
 
 ## Overview
 
-The TTAS contract provides:
+The TTASv1 contract provides:
 - Automatic payment splitting based on member shares
-- Democratic governance for adding members and updating shares
 - Historical payment tracking
 - Multi-token support
-- Share-based voting power
 
 
 ## Security
 
-This project is provided as is. While care has been taken to ensure security, please perform your own audits and due diligence before using in production.
+This project is provided as is. While care has been taken to ensure security, please perform your own audits and due diligence before use.
 
 ## Contributing
 
@@ -34,6 +30,7 @@ Please make sure to update tests as appropriate.
 
 If you find this project useful, consider supporting its development:
 
+EVM Address: 0x526C34d58f50Bc2b610352f211841caDB7b20caA
 
 ## License
 
@@ -51,4 +48,4 @@ If you use this code in your project, please provide attribution:
 
 - GitHub: [@utkuerkin](https://github.com/utkuerkin)
 - Twitter/X: [@ljjeth](https://x.com/ljjeth)
-_ Telegram: @utkuerkin
+- Telegram: @utkuerkin
