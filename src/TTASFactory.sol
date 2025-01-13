@@ -13,6 +13,20 @@ import "./interfaces/ITTAS.sol";
 contract TTASFactory is Ownable {
     using Clones for address;
 
+    /*//////////////////////////////////////////////////////////////
+                               ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    error InvalidImplementation();
+    error InvalidShares(string reason);
+    error InvalidTokens(string reason);
+    error InvalidInput(string reason);
+    error TooManyMembers(string reason);
+
+    /*//////////////////////////////////////////////////////////////
+                              STORAGE
+    //////////////////////////////////////////////////////////////*/
+
     // Implementation contract to use
     address public implementation;
     
@@ -22,6 +36,10 @@ contract TTASFactory is Ownable {
     // Default supported tokens (e.g., USDC, USDT, OP)
     address[] public defaultTokens;
     
+    /*//////////////////////////////////////////////////////////////
+                               EVENTS
+    //////////////////////////////////////////////////////////////*/
+
     event WalletCreated(
         address indexed walletAddress,
         address[] members,
@@ -31,36 +49,63 @@ contract TTASFactory is Ownable {
     
     event ImplementationUpdated(address indexed oldImpl, address indexed newImpl);
     
+    /*//////////////////////////////////////////////////////////////
+                              CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
     constructor(address _implementation, address[] memory _defaultTokens) Ownable(msg.sender) {
-        require(_implementation != address(0), "Invalid implementation");
-        require(_defaultTokens.length <= 10, "Max 10 tokens");
+        if(_implementation == address(0)) revert InvalidImplementation();
+        if(_defaultTokens.length > 10) revert InvalidTokens("Max 10 tokens");
         
         implementation = _implementation;
         
         for(uint256 i = 0; i < _defaultTokens.length; i++) {
-            require(_defaultTokens[i] != address(0), "Invalid token");
+            if(_defaultTokens[i] == address(0)) revert InvalidTokens("Invalid token");
+            
+            // Check for duplicates
+            for(uint256 j = 0; j < i; j++) {
+                if(_defaultTokens[i] == _defaultTokens[j]) revert InvalidTokens("Duplicate token");
+            }
+            
             defaultTokens.push(_defaultTokens[i]);
         }
     }
     
+    /*//////////////////////////////////////////////////////////////
+                            EXTERNAL FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
     function createWallet(
         address[] memory _members,
         uint256[] memory _shares,
         address[] memory _additionalTokens
     ) external returns (address) {
+        // Validate members and shares
+        if(_members.length > 12) revert TooManyMembers("Max 12 members");
+        if(_members.length == 0) revert InvalidShares("No members");
+        if(_members.length != _shares.length) revert InvalidShares("Invalid shares length");
+        
+        uint256 totalShareAmount;
+        for(uint256 i = 0; i < _members.length; i++) {
+            if(_members[i] == address(0)) revert InvalidShares("Zero address member");
+            if(_shares[i] == 0) revert InvalidShares("Zero shares");
+            totalShareAmount += _shares[i];
+        }
+        if(totalShareAmount != 100_000) revert InvalidShares("Total shares must equal 100%");
+
         // Check total tokens won't exceed 10
-        require(defaultTokens.length + _additionalTokens.length <= 10, "Max 10 tokens");
+        if(defaultTokens.length + _additionalTokens.length > 10) revert InvalidTokens("Max 10 tokens");
 
         // Check for duplicates in additional tokens
         for(uint256 i = 0; i < _additionalTokens.length; i++) {
-            require(_additionalTokens[i] != address(0), "Invalid token");
+            if(_additionalTokens[i] == address(0)) revert InvalidTokens("Invalid token");
             // Check against default tokens
             for(uint256 j = 0; j < defaultTokens.length; j++) {
-                require(_additionalTokens[i] != defaultTokens[j], "Duplicate token");
+                if(_additionalTokens[i] == defaultTokens[j]) revert InvalidTokens("Duplicate token");
             }
             // Check against other additional tokens
             for(uint256 j = 0; j < i; j++) {
-                require(_additionalTokens[i] != _additionalTokens[j], "Duplicate token");
+                if(_additionalTokens[i] == _additionalTokens[j]) revert InvalidTokens("Duplicate token");
             }
         }
         
@@ -91,7 +136,7 @@ contract TTASFactory is Ownable {
     }
     
     function updateImplementation(address _newImplementation) external onlyOwner {
-        require(_newImplementation != address(0), "Invalid implementation");
+        if(_newImplementation == address(0)) revert InvalidImplementation();
         address oldImplementation = implementation;
         implementation = _newImplementation;
         emit ImplementationUpdated(oldImplementation, _newImplementation);

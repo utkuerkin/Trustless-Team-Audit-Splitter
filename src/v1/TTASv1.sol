@@ -21,6 +21,9 @@ contract TTASv1 is ITTAS, Initializable {
     /// @notice Maximum total shares possible (100%)
     uint256 private constant MAX_TOTAL_SHARES = 100_000;
 
+    /// @notice Version number of the contract
+    uint256 public constant VERSION = 1;
+
     /*//////////////////////////////////////////////////////////////
                               STATE VARS
     //////////////////////////////////////////////////////////////*/
