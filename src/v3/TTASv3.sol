@@ -31,7 +31,10 @@ pragma solidity ^0.8.24;
 ///        balanceOf(this) >= sum(owed) + sum(accrued) (up to wei-level rounding dust).
 ///      Rounding always favours the contract (members are floored once per share
 ///      epoch), so the wallet cannot become insolvent from accounting; a few wei of
-///      dust per distribution change is unrecoverable by design.
+///      dust per distribution change is unrecoverable by design. Within a share
+///      epoch no dust is lost: accPerShare retains sub-unit remainders, _harvest
+///      advances rewardDebt by whole paid units only, and quarantine settlement
+///      accounts only what it actually allocates so its remainder carries forward.
 ///
 ///      Token assumptions. Best with standard fixed-supply ERC20s (USDC, USDT,
 ///      DAI, WETH, ...). Compatibility details and failure modes:
@@ -448,12 +451,16 @@ contract TTASv3 is ITTASv3, Initializable {
     /// @dev Permissionless and repeatable. Already-accounted owed balances are not
     ///      redistributed. The token stays quarantined so later funds cannot be
     ///      stranded by an early third-party settlement.
-    function settleQuarantinedToken(address token) external returns (uint256 newFunds) {
+    /// @return settled Amount actually allocated to members. Only this amount is
+    ///         marked accounted, so the pro-rata flooring remainder stays visible to
+    ///         the next call and combines with later deposits. Accounting the full
+    ///         observed balance here would discard up to (members - 1) base units on
+    ///         every call, which repeated small settlements could compound.
+    function settleQuarantinedToken(address token) external returns (uint256 settled) {
         if (tokenState[token] != TokenState.QUARANTINED) revert TokenNotQuarantined();
 
-        (bool available, uint256 funds) = _newFunds(token);
+        (bool available, uint256 newFunds) = _newFunds(token);
         if (!available) revert TokenUnavailable(token);
-        newFunds = funds;
 
         address[] storage members = _quarantineMembers[token];
         uint256[] storage frozenShares = _quarantineShares[token];
@@ -461,12 +468,14 @@ contract TTASv3 is ITTASv3, Initializable {
             uint256 amount = _proRata(newFunds, frozenShares[i]);
             if (amount > 0) {
                 owed[members[i]][token] += amount;
+                settled += amount;
             }
         }
 
-        totalAccounted[token] += newFunds;
-
-        emit QuarantinedFundsSettled(token, newFunds);
+        if (settled > 0) {
+            totalAccounted[token] += settled;
+            emit QuarantinedFundsSettled(token, settled);
+        }
     }
 
     /// @notice Leaves the team unilaterally. The caller's accrued earnings are

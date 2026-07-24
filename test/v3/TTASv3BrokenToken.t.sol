@@ -370,10 +370,59 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         w.executeProposal(removalId);
 
         brk.setBroken(false);
-        assertEq(w.settleQuarantinedToken(address(brk)), amount);
+        uint256 settled = w.settleQuarantinedToken(address(brk));
 
+        // Only whole allocated units are marked accounted. Liabilities match the
+        // allocation exactly, and the flooring remainder (< one unit per frozen
+        // member) stays unaccounted so a later settlement can still allocate it.
         uint256 liabilities = w.claimable(memberA, address(brk)) + w.claimable(memberB, address(brk));
-        assertLe(liabilities, amount);
-        assertEq(w.totalAccounted(address(brk)), amount);
+        assertEq(liabilities, settled);
+        assertEq(w.totalAccounted(address(brk)), settled);
+        assertLe(settled, amount);
+        assertLt(amount - settled, 2);
+    }
+
+    /// @dev Regression: settlement used to mark the full observed balance accounted
+    ///      while allocating only floored pro-rata amounts, so the remainder was
+    ///      destroyed on every call. Repeatedly settling tiny deposits therefore
+    ///      stranded everything (50 deposits of 2 units across 3 members floored to
+    ///      zero every time, losing all 100 units). The remainder now carries
+    ///      forward, so chunked settlement is as accurate as a single settlement.
+    function testChunkedQuarantineSettlementDoesNotDestroyRemainder() public {
+        TTASv3 three = TTASv3(
+            factory.createWallet(
+                _addrs(memberA, memberB, memberC),
+                _nums(33_334, 33_333, 33_333),
+                _addrs(address(brk)),
+                SUPERMAJORITY
+            )
+        );
+
+        brk.setBroken(true);
+        vm.prank(memberA);
+        uint256 removalId = three.proposeRemoveToken(address(brk));
+        vm.prank(memberA);
+        three.vote(removalId, true);
+        vm.prank(memberB);
+        three.vote(removalId, true);
+        three.executeProposal(removalId);
+        assertEq(uint256(three.tokenState(address(brk))), uint256(TTASv3.TokenState.QUARANTINED));
+        brk.setBroken(false);
+
+        // 50 separate 2-unit payouts, each settled immediately. Every individual
+        // settlement floors to zero for all three members.
+        for (uint256 i = 0; i < 50; i++) {
+            brk.mint(address(three), 2);
+            three.settleQuarantinedToken(address(brk));
+        }
+
+        uint256 total = three.claimable(memberA, address(brk)) + three.claimable(memberB, address(brk))
+            + three.claimable(memberC, address(brk));
+
+        // Standing remainder is always below one unit per frozen member, so chunked
+        // settlement recovers essentially everything instead of nothing.
+        assertGe(total, 100 - 3);
+        assertEq(three.totalAccounted(address(brk)), total);
+        assertLe(total, 100);
     }
 }

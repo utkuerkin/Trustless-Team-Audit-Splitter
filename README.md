@@ -96,11 +96,20 @@ set. Execution has two outcomes:
 - An unreadable token is removed from active use and becomes `QUARANTINED`.
   Current members and shares are frozen for that token.
 
+Which outcome occurs is decided by whether `balanceOf` responds at the moment
+`executeProposal` is mined, not when the proposal was created or voted on. Only
+`QUARANTINED` keeps later balances recoverable. Do not remove a token that may
+still receive a payout: retire a token only after every expected payment to that
+address has arrived and been claimed. If a payment is still outstanding, keep the
+token active, or recover it and settle before removing it.
+
 Once a quarantined token becomes readable, anyone may call
 `settleQuarantinedToken(token)`. Previously accounted claims are unchanged. Only
 the unaccounted balance is allocated using the frozen shares. Settlement is
 repeatable and the token remains `QUARANTINED`, so an early zero-value call
-cannot strand a delayed payout.
+cannot strand a delayed payout. Each call allocates whole base units only and
+carries the pro-rata remainder forward to the next call, so splitting a payout
+across many settlements does not discard funds.
 
 Removal frees one active token slot. A quarantined or retired address cannot be
 added again because its earlier accounting remains stored.
