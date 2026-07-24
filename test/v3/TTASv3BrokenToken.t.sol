@@ -33,6 +33,17 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         }
     }
 
+    function _proposeAndPassRetirement(TTASv3 wallet_, address token) internal returns (uint256 id) {
+        vm.prank(memberA);
+        id = wallet_.proposeRetireToken(token);
+        vm.prank(memberA);
+        wallet_.vote(id, true);
+        if (wallet_.proposalStatus(id) == TTASv3.ProposalStatus.ACTIVE) {
+            vm.prank(memberB);
+            wallet_.vote(id, true);
+        }
+    }
+
     function _passDistributionOn(TTASv3 wallet_, address[] memory members, uint256[] memory newShares)
         internal
         returns (uint256 id)
@@ -217,6 +228,30 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         assertEq(w.claimable(memberB, address(brk)), 600e18);
     }
 
+    function testClaimBetweenQuarantineSettlementsPreservesCumulativeShares() public {
+        uint256 removalId = _proposeAndPassRemoval(w, address(brk));
+        w.executeProposal(removalId);
+
+        brk.mint(address(w), 3);
+        assertEq(w.settleQuarantinedToken(address(brk)), 3);
+        assertEq(w.claimable(memberA, address(brk)), 1);
+        assertEq(w.claimable(memberB, address(brk)), 1);
+
+        vm.prank(memberA);
+        assertEq(w.claim(address(brk)), 1);
+
+        brk.mint(address(w), 2);
+        assertEq(w.settleQuarantinedToken(address(brk)), 2);
+
+        // Cumulative entitlement at five units is exactly 3/2. A's prior claim
+        // changes balance and totalReleased equally, so it cannot change this split.
+        assertEq(brk.balanceOf(memberA), 1);
+        assertEq(w.claimable(memberA, address(brk)), 2);
+        assertEq(w.claimable(memberB, address(brk)), 2);
+        assertEq(w.quarantineRecovered(address(brk)), 5);
+        assertEq(w.totalAccounted(address(brk)), 5);
+    }
+
     function testMalformedSuccessfulBalanceResponsesUseQuarantinePath() public {
         brk.mint(address(w), 1000e18);
         brk.setMalformed(true);
@@ -242,32 +277,37 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         assertEq(w.claimable(memberB, address(brk)), 400e18);
     }
 
-    function testHealthyRemovalRetiresTokenAndPreservesOldClaims() public {
+    function testHealthyRemovalQuarantinesTokenAndPreservesFrozenShares() public {
         brk.mint(address(w), 1000e18);
         uint256 removalId = _proposeAndPassRemoval(w, address(brk));
         w.executeProposal(removalId);
 
-        assertEq(uint256(w.tokenState(address(brk))), uint256(TTASv3.TokenState.RETIRED));
+        assertEq(uint256(w.tokenState(address(brk))), uint256(TTASv3.TokenState.QUARANTINED));
         assertFalse(w.isSupportedToken(address(brk)));
         assertEq(w.getTokens().length, 1);
         assertEq(w.claimable(memberA, address(brk)), 600e18);
         assertEq(w.claimable(memberB, address(brk)), 400e18);
 
+        brk.mint(address(w), 500e18);
+        assertEq(w.settleQuarantinedToken(address(brk)), 500e18);
+
         _passDistributionOn(w, _addrs(memberA, memberB, memberC), _nums(40_000, 30_000, 30_000));
-        assertEq(w.claimable(memberA, address(brk)), 600e18);
-        assertEq(w.claimable(memberB, address(brk)), 400e18);
+        assertEq(w.claimable(memberA, address(brk)), 900e18);
+        assertEq(w.claimable(memberB, address(brk)), 600e18);
         assertEq(w.claimable(memberC, address(brk)), 0);
 
         vm.prank(memberA);
-        assertEq(w.claim(address(brk)), 600e18);
+        assertEq(w.claim(address(brk)), 900e18);
         vm.prank(memberB);
-        assertEq(w.claim(address(brk)), 400e18);
+        assertEq(w.claim(address(brk)), 600e18);
     }
 
     function testClaimAllSkipsRetiredTokenWhichRemainsIndividuallyClaimable() public {
         brk.mint(address(w), 1000e18);
         uint256 removalId = _proposeAndPassRemoval(w, address(brk));
         w.executeProposal(removalId);
+        uint256 retirementId = _proposeAndPassRetirement(w, address(brk));
+        w.executeProposal(retirementId);
         dai.mint(address(w), 1000e18);
 
         vm.prank(memberA);
@@ -308,11 +348,13 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         cappedWallet.proposeAddToken(address(brk));
     }
 
-    function testDuplicateConcurrentRemovalProposalIsCancelled() public {
+    function testOnlyOneLiveRemovalProposalExistsPerToken() public {
         vm.prank(memberA);
         uint256 idA = w.proposeRemoveToken(address(brk));
+
+        vm.expectRevert(TTASv3.ProposalStillActive.selector);
         vm.prank(memberB);
-        uint256 idB = w.proposeRemoveToken(address(brk));
+        w.proposeRemoveToken(address(brk));
 
         TTASv3.ProposalView memory proposal = w.getProposal(idA);
         assertEq(uint256(proposal.proposalType), uint256(TTASv3.ProposalType.REMOVE_TOKEN));
@@ -322,14 +364,9 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         w.vote(idA, true);
         vm.prank(memberB);
         w.vote(idA, true);
-        vm.prank(memberA);
-        w.vote(idB, true);
-        vm.prank(memberB);
-        w.vote(idB, true);
 
         w.executeProposal(idA);
         assertEq(uint256(w.proposalStatus(idA)), uint256(TTASv3.ProposalStatus.EXECUTED));
-        assertEq(uint256(w.proposalStatus(idB)), uint256(TTASv3.ProposalStatus.CANCELLED));
     }
 
     function testHealthyTokenClaimableWhileOtherActiveTokenBroken() public {
@@ -353,10 +390,65 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         uint256 removalId = _proposeAndPassRemoval(w, address(brk));
         w.executeProposal(removalId);
 
+        // Funds arriving before the explicit retirement vote are settled at the
+        // frozen shares by retirement execution itself.
         brk.mint(address(w), 500e18);
-        assertEq(w.claimable(memberA, address(brk)), 600e18);
+        uint256 retirementId = _proposeAndPassRetirement(w, address(brk));
+        w.executeProposal(retirementId);
+        assertEq(uint256(w.tokenState(address(brk))), uint256(TTASv3.TokenState.RETIRED));
+        assertEq(w.claimable(memberA, address(brk)), 900e18);
+        assertEq(w.claimable(memberB, address(brk)), 600e18);
+
+        // Only funds sent after an explicit retirement are intentionally ignored.
+        brk.mint(address(w), 250e18);
+        assertEq(w.claimable(memberA, address(brk)), 900e18);
         vm.expectRevert(TTASv3.TokenNotQuarantined.selector);
         w.settleQuarantinedToken(address(brk));
+    }
+
+    function testRetirementFailsClosedUntilTokenIsReadable() public {
+        brk.mint(address(w), 1000);
+        uint256 removalId = _proposeAndPassRemoval(w, address(brk));
+        w.executeProposal(removalId);
+
+        brk.mint(address(w), 500);
+        uint256 retirementId = _proposeAndPassRetirement(w, address(brk));
+        brk.setBroken(true);
+
+        vm.expectRevert(abi.encodeWithSelector(TTASv3.TokenUnavailable.selector, address(brk)));
+        w.executeProposal(retirementId);
+        assertEq(uint256(w.tokenState(address(brk))), uint256(TTASv3.TokenState.QUARANTINED));
+        assertEq(uint256(w.proposalStatus(retirementId)), uint256(TTASv3.ProposalStatus.PASSED));
+
+        brk.setBroken(false);
+        w.executeProposal(retirementId);
+        assertEq(uint256(w.tokenState(address(brk))), uint256(TTASv3.TokenState.RETIRED));
+        assertEq(w.claimable(memberA, address(brk)), 900);
+        assertEq(w.claimable(memberB, address(brk)), 600);
+    }
+
+    function testExplicitRetirementCancelsDuplicateRetirementProposal() public {
+        uint256 removalId = _proposeAndPassRemoval(w, address(brk));
+        w.executeProposal(removalId);
+
+        vm.prank(memberA);
+        uint256 idA = w.proposeRetireToken(address(brk));
+        vm.prank(memberB);
+        uint256 idB = w.proposeRetireToken(address(brk));
+
+        vm.prank(memberA);
+        w.vote(idA, true);
+        vm.prank(memberB);
+        w.vote(idA, true);
+        vm.prank(memberA);
+        w.vote(idB, true);
+        vm.prank(memberB);
+        w.vote(idB, true);
+
+        w.executeProposal(idA);
+        assertEq(uint256(w.proposalStatus(idA)), uint256(TTASv3.ProposalStatus.EXECUTED));
+        assertEq(uint256(w.proposalStatus(idB)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(uint256(w.tokenState(address(brk))), uint256(TTASv3.TokenState.RETIRED));
     }
 
     function testFuzz_QuarantineSettlementRemainsSolvent(uint256 newShareA, uint256 amount) public {
@@ -370,31 +462,23 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         w.executeProposal(removalId);
 
         brk.setBroken(false);
-        uint256 settled = w.settleQuarantinedToken(address(brk));
+        uint256 recovered = w.settleQuarantinedToken(address(brk));
 
-        // Only whole allocated units are marked accounted. Liabilities match the
-        // allocation exactly, and the flooring remainder (< one unit per frozen
-        // member) stays unaccounted so a later settlement can still allocate it.
+        // Every observed unit is accounted once, while member liabilities remain
+        // contract-favouring by less than one unit per frozen member.
         uint256 liabilities = w.claimable(memberA, address(brk)) + w.claimable(memberB, address(brk));
-        assertEq(liabilities, settled);
-        assertEq(w.totalAccounted(address(brk)), settled);
-        assertLe(settled, amount);
-        assertLt(amount - settled, 2);
+        assertEq(recovered, amount);
+        assertEq(w.quarantineRecovered(address(brk)), amount);
+        assertEq(w.totalAccounted(address(brk)), amount);
+        assertLe(liabilities, amount);
+        assertLt(amount - liabilities, 2);
     }
 
-    /// @dev Regression: settlement used to mark the full observed balance accounted
-    ///      while allocating only floored pro-rata amounts, so the remainder was
-    ///      destroyed on every call. Repeatedly settling tiny deposits therefore
-    ///      stranded everything (50 deposits of 2 units across 3 members floored to
-    ///      zero every time, losing all 100 units). The remainder now carries
-    ///      forward, so chunked settlement is as accurate as a single settlement.
-    function testChunkedQuarantineSettlementDoesNotDestroyRemainder() public {
+    /// @dev Chunking cannot change any member's cumulative frozen-share entitlement.
+    function testChunkedQuarantineSettlementMatchesAggregatePerMember() public {
         TTASv3 three = TTASv3(
             factory.createWallet(
-                _addrs(memberA, memberB, memberC),
-                _nums(33_334, 33_333, 33_333),
-                _addrs(address(brk)),
-                SUPERMAJORITY
+                _addrs(memberA, memberB, memberC), _nums(33_334, 33_333, 33_333), _addrs(address(brk)), SUPERMAJORITY
             )
         );
 
@@ -409,20 +493,69 @@ contract TTASv3BrokenTokenTest is TTASv3TestBase {
         assertEq(uint256(three.tokenState(address(brk))), uint256(TTASv3.TokenState.QUARANTINED));
         brk.setBroken(false);
 
-        // 50 separate 2-unit payouts, each settled immediately. Every individual
-        // settlement floors to zero for all three members.
         for (uint256 i = 0; i < 50; i++) {
             brk.mint(address(three), 2);
             three.settleQuarantinedToken(address(brk));
         }
 
-        uint256 total = three.claimable(memberA, address(brk)) + three.claimable(memberB, address(brk))
-            + three.claimable(memberC, address(brk));
+        assertEq(three.claimable(memberA, address(brk)), 33);
+        assertEq(three.claimable(memberB, address(brk)), 33);
+        assertEq(three.claimable(memberC, address(brk)), 33);
+        assertEq(three.quarantineRecovered(address(brk)), 100);
+        assertEq(three.totalAccounted(address(brk)), 100);
+    }
 
-        // Standing remainder is always below one unit per frozen member, so chunked
-        // settlement recovers essentially everything instead of nothing.
-        assertGe(total, 100 - 3);
-        assertEq(three.totalAccounted(address(brk)), total);
-        assertLe(total, 100);
+    function testOneUnitSettlementsPreserveSixtyFortyShares() public {
+        BreakableERC20 token = new BreakableERC20();
+        TTASv3 sixtyForty = TTASv3(
+            factory.createWallet(_addrs(memberA, memberB), _nums(60_000, 40_000), _addrs(address(token)), SUPERMAJORITY)
+        );
+
+        token.setBroken(true);
+        uint256 removalId = _proposeAndPassRemoval(sixtyForty, address(token));
+        sixtyForty.executeProposal(removalId);
+        token.setBroken(false);
+
+        for (uint256 i = 0; i < 100; i++) {
+            token.mint(address(sixtyForty), 1);
+            sixtyForty.settleQuarantinedToken(address(token));
+        }
+
+        assertEq(sixtyForty.claimable(memberA, address(token)), 60);
+        assertEq(sixtyForty.claimable(memberB, address(token)), 40);
+        assertEq(sixtyForty.totalAccounted(address(token)), 100);
+    }
+
+    function testFuzz_ChunkedSettlementMatchesCumulativeEntitlement(
+        uint256 shareA,
+        uint256 firstAmount,
+        uint256 secondAmount
+    ) public {
+        shareA = bound(shareA, 1, 99_999);
+        firstAmount = bound(firstAmount, 0, 1e30);
+        secondAmount = bound(secondAmount, 0, 1e30);
+
+        BreakableERC20 token = new BreakableERC20();
+        TTASv3 chunked = TTASv3(
+            factory.createWallet(
+                _addrs(memberA, memberB), _nums(shareA, 100_000 - shareA), _addrs(address(token)), SUPERMAJORITY
+            )
+        );
+
+        token.setBroken(true);
+        uint256 removalId = _proposeAndPassRemoval(chunked, address(token));
+        chunked.executeProposal(removalId);
+        token.setBroken(false);
+
+        token.mint(address(chunked), firstAmount);
+        chunked.settleQuarantinedToken(address(token));
+        token.mint(address(chunked), secondAmount);
+        chunked.settleQuarantinedToken(address(token));
+
+        uint256 total = firstAmount + secondAmount;
+        assertEq(chunked.claimable(memberA, address(token)), (total * shareA) / 100_000);
+        assertEq(chunked.claimable(memberB, address(token)), (total * (100_000 - shareA)) / 100_000);
+        assertEq(chunked.quarantineRecovered(address(token)), total);
+        assertEq(chunked.totalAccounted(address(token)), total);
     }
 }

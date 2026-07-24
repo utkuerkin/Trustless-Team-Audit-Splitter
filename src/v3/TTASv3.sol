@@ -34,7 +34,7 @@ pragma solidity ^0.8.24;
 ///      dust per distribution change is unrecoverable by design. Within a share
 ///      epoch no dust is lost: accPerShare retains sub-unit remainders, _harvest
 ///      advances rewardDebt by whole paid units only, and quarantine settlement
-///      accounts only what it actually allocates so its remainder carries forward.
+///      credits changes in each member's cumulative frozen-share entitlement.
 ///
 ///      Token assumptions. Best with standard fixed-supply ERC20s (USDC, USDT,
 ///      DAI, WETH, ...). Compatibility details and failure modes:
@@ -69,11 +69,11 @@ pragma solidity ^0.8.24;
 ///          leave() also requires every active token to be readable. Prefer a
 ///          supermajority over unanimity unless every member's key liveness is
 ///          assured.
-///        - Each member may have at most one live proposal, so up to MAX_MEMBERS
-///          proposals may proceed concurrently. This prevents one minority member
-///          from monopolizing a global proposal slot. Any membership change cancels
-///          every other live proposal because its recorded vote weights are stale.
-///          Already-earned funds (owed) are always claimable regardless.
+///        - Each member may have at most one normal live proposal. Recoverable token
+///          removals instead use one lane per active token, so unreadable-token
+///          recovery remains available even if every member slot is occupied. Any
+///          membership change cancels every live proposal because its recorded vote
+///          weights are stale. Already-earned funds remain claimable regardless.
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -93,8 +93,10 @@ contract TTASv3 is ITTASv3, Initializable {
         DISTRIBUTION,
         // Whitelist an additional payment token.
         ADD_TOKEN,
-        // Remove a payment token from the active set.
-        REMOVE_TOKEN
+        // Remove a payment token into recoverable quarantine.
+        REMOVE_TOKEN,
+        // Permanently stop accounting future funds for a quarantined token.
+        RETIRE_TOKEN
     }
 
     enum TokenState {
@@ -102,9 +104,9 @@ contract TTASv3 is ITTASv3, Initializable {
         UNSUPPORTED,
         // Included in the active token list and accumulator accounting.
         ACTIVE,
-        // Removed while unreadable; future balances use a frozen share table.
+        // Removed from active use; future balances use a frozen share table.
         QUARANTINED,
-        // Removed while readable; future balances are not accounted.
+        // Explicitly retired after quarantine; future balances are not accounted.
         RETIRED
     }
 
@@ -127,7 +129,7 @@ contract TTASv3 is ITTASv3, Initializable {
     struct Proposal {
         ProposalType proposalType;
         address proposer;
-        address token; // ADD_TOKEN and REMOVE_TOKEN proposals only
+        address token; // Token lifecycle proposals only
         address[] members; // DISTRIBUTION proposals only
         uint256[] shares; // DISTRIBUTION proposals only
         uint64 deadline;
@@ -218,6 +220,10 @@ contract TTASv3 is ITTASv3, Initializable {
     ///      to this frozen share epoch.
     mapping(address => address[]) private _quarantineMembers;
     mapping(address => uint256[]) private _quarantineShares;
+    /// @notice Cumulative funds allocated under a token's frozen quarantine shares.
+    /// @dev Member credits are calculated from cumulative entitlement deltas, making
+    ///      the result independent of how deposits are split across settlement calls.
+    mapping(address => uint256) public quarantineRecovered;
 
     // Accumulator accounting, per token (see contract-level natspec).
     mapping(address => uint256) public accPerShare;
@@ -240,6 +246,10 @@ contract TTASv3 is ITTASv3, Initializable {
     /// @dev proposer => proposal id + 1. Entries for terminal proposals are cleared
     ///      lazily when the proposer creates again or eagerly on invalidation.
     mapping(address => uint256) private _liveProposalPlusOne;
+    /// @dev Active token => recoverable-removal proposal id + 1. Removal proposals
+    ///      use a token-keyed lane, so occupied member slots cannot block recovery
+    ///      from an unreadable token. At most one exists per active token.
+    mapping(address => uint256) private _liveRemovalProposalPlusOne;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -393,13 +403,24 @@ contract TTASv3 is ITTASv3, Initializable {
         _proposals[proposalId].token = token;
     }
 
-    /// @notice Proposes permanently removing a token from the active token set.
-    /// @dev A readable token is synchronized and retired immediately on execution.
-    ///      An unreadable token is quarantined with the current share table frozen
-    ///      for later settlement. Removed token addresses cannot be added again.
+    /// @notice Proposes removing a token from active use into recoverable quarantine.
+    /// @dev This proposal uses a token-keyed recovery lane instead of the proposer's
+    ///      normal slot. On execution, readable funds are synchronized first when
+    ///      possible, and the current share table is always frozen for later funds.
+    ///      Removed token addresses cannot be added again.
     function proposeRemoveToken(address token) external onlyMember returns (uint256 proposalId) {
         if (tokenState[token] != TokenState.ACTIVE) revert UnsupportedToken();
-        proposalId = _createProposal(ProposalType.REMOVE_TOKEN);
+        proposalId = _createRemovalProposal(token);
+    }
+
+    /// @notice Proposes permanently retiring a quarantined token.
+    /// @dev Execution first settles every currently observable balance at the frozen
+    ///      shares. Once passed, execution is permissionless. Funds sent after
+    ///      retirement are intentionally unrecoverable, so governance must not pass
+    ///      this proposal while a payment is still expected.
+    function proposeRetireToken(address token) external onlyMember returns (uint256 proposalId) {
+        if (tokenState[token] != TokenState.QUARANTINED) revert TokenNotQuarantined();
+        proposalId = _createProposal(ProposalType.RETIRE_TOKEN);
         _proposals[proposalId].token = token;
     }
 
@@ -438,10 +459,13 @@ contract TTASv3 is ITTASv3, Initializable {
             _addToken(p.token);
             _clearProposalSlot(p.proposer, proposalId);
             _cancelInvalidAddTokenProposals(p.token);
-        } else {
+        } else if (p.proposalType == ProposalType.REMOVE_TOKEN) {
             _removeToken(p.token);
+            _clearRemovalProposalSlot(p.token, proposalId);
+        } else {
+            _retireToken(p.token);
             _clearProposalSlot(p.proposer, proposalId);
-            _cancelInvalidRemoveTokenProposals(p.token);
+            _cancelInvalidRetireTokenProposals(p.token);
         }
         emit ProposalExecuted(proposalId);
     }
@@ -451,30 +475,34 @@ contract TTASv3 is ITTASv3, Initializable {
     /// @dev Permissionless and repeatable. Already-accounted owed balances are not
     ///      redistributed. The token stays quarantined so later funds cannot be
     ///      stranded by an early third-party settlement.
-    /// @return settled Amount actually allocated to members. Only this amount is
-    ///         marked accounted, so the pro-rata flooring remainder stays visible to
-    ///         the next call and combines with later deposits. Accounting the full
-    ///         observed balance here would discard up to (members - 1) base units on
-    ///         every call, which repeated small settlements could compound.
-    function settleQuarantinedToken(address token) external returns (uint256 settled) {
+    /// @return newFunds Newly observed funds accounted by this settlement.
+    function settleQuarantinedToken(address token) external returns (uint256 newFunds) {
         if (tokenState[token] != TokenState.QUARANTINED) revert TokenNotQuarantined();
+        return _settleQuarantinedToken(token);
+    }
 
-        (bool available, uint256 newFunds) = _newFunds(token);
+    function _settleQuarantinedToken(address token) private returns (uint256 newFunds) {
+        (bool available, uint256 funds) = _newFunds(token);
         if (!available) revert TokenUnavailable(token);
+        newFunds = funds;
 
+        uint256 previousRecovered = quarantineRecovered[token];
+        uint256 nextRecovered = previousRecovered + newFunds;
         address[] storage members = _quarantineMembers[token];
         uint256[] storage frozenShares = _quarantineShares[token];
         for (uint256 i = 0; i < members.length; i++) {
-            uint256 amount = _proRata(newFunds, frozenShares[i]);
+            uint256 previousEntitlement = _proRata(previousRecovered, frozenShares[i]);
+            uint256 nextEntitlement = _proRata(nextRecovered, frozenShares[i]);
+            uint256 amount = nextEntitlement - previousEntitlement;
             if (amount > 0) {
                 owed[members[i]][token] += amount;
-                settled += amount;
             }
         }
 
-        if (settled > 0) {
-            totalAccounted[token] += settled;
-            emit QuarantinedFundsSettled(token, settled);
+        if (newFunds > 0) {
+            quarantineRecovered[token] = nextRecovered;
+            totalAccounted[token] += newFunds;
+            emit QuarantinedFundsSettled(token, newFunds);
         }
     }
 
@@ -532,7 +560,7 @@ contract TTASv3 is ITTASv3, Initializable {
         return _tokenList;
     }
 
-    /// @notice Frozen member table for an unreadable token removed from active use.
+    /// @notice Frozen member table for a token removed from active use.
     function getQuarantineSnapshot(address token)
         external
         view
@@ -565,13 +593,20 @@ contract TTASv3 is ITTASv3, Initializable {
         return owed[account][token] + accrued;
     }
 
-    /// @notice IDs of all currently ACTIVE or PASSED proposals. At most one entry
-    ///         exists per current member, so both loops are bounded by MAX_MEMBERS.
+    /// @notice IDs of all currently ACTIVE or PASSED proposals. Normal proposals are
+    ///         bounded by MAX_MEMBERS and recovery proposals by MAX_TOKENS.
     function getLiveProposalIds() external view returns (uint256[] memory ids) {
         uint256 memberCount = _memberList.length;
+        uint256 tokenCount = _tokenList.length;
         uint256 count;
         for (uint256 i = 0; i < memberCount; i++) {
             uint256 plusOne = _liveProposalPlusOne[_memberList[i]];
+            if (plusOne == 0) continue;
+            ProposalStatus status = proposalStatus(plusOne - 1);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) count++;
+        }
+        for (uint256 i = 0; i < tokenCount; i++) {
+            uint256 plusOne = _liveRemovalProposalPlusOne[_tokenList[i]];
             if (plusOne == 0) continue;
             ProposalStatus status = proposalStatus(plusOne - 1);
             if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) count++;
@@ -581,6 +616,15 @@ contract TTASv3 is ITTASv3, Initializable {
         uint256 k;
         for (uint256 i = 0; i < memberCount; i++) {
             uint256 plusOne = _liveProposalPlusOne[_memberList[i]];
+            if (plusOne == 0) continue;
+            uint256 proposalId = plusOne - 1;
+            ProposalStatus status = proposalStatus(proposalId);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                ids[k++] = proposalId;
+            }
+        }
+        for (uint256 i = 0; i < tokenCount; i++) {
+            uint256 plusOne = _liveRemovalProposalPlusOne[_tokenList[i]];
             if (plusOne == 0) continue;
             uint256 proposalId = plusOne - 1;
             ProposalStatus status = proposalStatus(proposalId);
@@ -760,13 +804,13 @@ contract TTASv3 is ITTASv3, Initializable {
         }
     }
 
-    /// @dev Removes an active token. A readable token is first synchronized and
-    ///      retired. If it is unavailable, already-accounted accrual is preserved
-    ///      and the current share table is frozen for its unaccounted balance.
+    /// @dev Removes an active token into recoverable quarantine. A readable token is
+    ///      synchronized first; otherwise already-accounted accrual is preserved.
+    ///      The current share table is always frozen for current and future balances.
     function _removeToken(address token) private {
         if (tokenState[token] != TokenState.ACTIVE) revert UnsupportedToken();
 
-        bool synchronized = _trySync(token);
+        _trySync(token);
         uint256 memberCount = _memberList.length;
 
         for (uint256 i = 0; i < memberCount; i++) {
@@ -777,22 +821,24 @@ contract TTASv3 is ITTASv3, Initializable {
             }
             rewardDebt[member][token] = 0;
 
-            if (!synchronized) {
-                _quarantineMembers[token].push(member);
-                _quarantineShares[token].push(_shares[member]);
-            }
+            _quarantineMembers[token].push(member);
+            _quarantineShares[token].push(_shares[member]);
         }
 
         _removeActiveToken(token);
         isSupportedToken[token] = false;
+        tokenState[token] = TokenState.QUARANTINED;
+        emit TokenQuarantined(token);
+    }
 
-        if (synchronized) {
-            tokenState[token] = TokenState.RETIRED;
-            emit TokenRetired(token);
-        } else {
-            tokenState[token] = TokenState.QUARANTINED;
-            emit TokenQuarantined(token);
-        }
+    /// @dev Finalizes an explicit retirement vote. Any balance visible at execution
+    ///      is settled first. The passed vote authorizes a permissionless cutoff;
+    ///      transfers that arrive after execution are not recoverable.
+    function _retireToken(address token) private {
+        if (tokenState[token] != TokenState.QUARANTINED) revert TokenNotQuarantined();
+        _settleQuarantinedToken(token);
+        tokenState[token] = TokenState.RETIRED;
+        emit TokenRetired(token);
     }
 
     function _removeActiveToken(address token) private {
@@ -825,17 +871,34 @@ contract TTASv3 is ITTASv3, Initializable {
                 revert ProposalStillActive();
             }
         }
+        proposalId = _initializeProposal(proposalType);
+        _liveProposalPlusOne[msg.sender] = proposalId + 1;
+    }
+
+    function _createRemovalProposal(address token) private returns (uint256 proposalId) {
+        uint256 previousPlusOne = _liveRemovalProposalPlusOne[token];
+        if (previousPlusOne > 0) {
+            ProposalStatus status = proposalStatus(previousPlusOne - 1);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                revert ProposalStillActive();
+            }
+        }
+        proposalId = _initializeProposal(ProposalType.REMOVE_TOKEN);
+        _proposals[proposalId].token = token;
+        _liveRemovalProposalPlusOne[token] = proposalId + 1;
+    }
+
+    function _initializeProposal(ProposalType proposalType) private returns (uint256 proposalId) {
         proposalId = proposalCount++;
         Proposal storage p = _proposals[proposalId];
         p.proposalType = proposalType;
         p.proposer = msg.sender;
         p.deadline = uint64(block.timestamp + VOTING_PERIOD);
-        _liveProposalPlusOne[msg.sender] = proposalId + 1;
         emit ProposalCreated(proposalId, msg.sender, proposalType);
     }
 
     /// @dev Cancels every live proposal whose votes use the current share table.
-    ///      One-live-proposal-per-member bounds this loop by MAX_MEMBERS.
+    ///      Loops are bounded by MAX_MEMBERS normal slots and MAX_TOKENS recovery slots.
     function _cancelAllLiveProposals() private {
         uint256 memberCount = _memberList.length;
         for (uint256 i = 0; i < memberCount; i++) {
@@ -849,6 +912,19 @@ contract TTASv3 is ITTASv3, Initializable {
                 emit ProposalCancelled(proposalId);
             }
             delete _liveProposalPlusOne[proposer];
+        }
+        uint256 tokenCount = _tokenList.length;
+        for (uint256 i = 0; i < tokenCount; i++) {
+            address token = _tokenList[i];
+            uint256 plusOne = _liveRemovalProposalPlusOne[token];
+            if (plusOne == 0) continue;
+            uint256 proposalId = plusOne - 1;
+            ProposalStatus status = proposalStatus(proposalId);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                _proposals[proposalId].cancelled = true;
+                emit ProposalCancelled(proposalId);
+            }
+            delete _liveRemovalProposalPlusOne[token];
         }
     }
 
@@ -874,9 +950,8 @@ contract TTASv3 is ITTASv3, Initializable {
         }
     }
 
-    /// @dev Removing a token invalidates concurrent removal proposals for the same
-    ///      address without disturbing proposals for distributions or other tokens.
-    function _cancelInvalidRemoveTokenProposals(address removedToken) private {
+    /// @dev Retirement invalidates concurrent retirement proposals for the same token.
+    function _cancelInvalidRetireTokenProposals(address retiredToken) private {
         uint256 memberCount = _memberList.length;
         for (uint256 i = 0; i < memberCount; i++) {
             address proposer = _memberList[i];
@@ -884,7 +959,7 @@ contract TTASv3 is ITTASv3, Initializable {
             if (plusOne == 0) continue;
             uint256 proposalId = plusOne - 1;
             Proposal storage candidate = _proposals[proposalId];
-            if (candidate.proposalType == ProposalType.REMOVE_TOKEN && candidate.token == removedToken) {
+            if (candidate.proposalType == ProposalType.RETIRE_TOKEN && candidate.token == retiredToken) {
                 ProposalStatus status = proposalStatus(proposalId);
                 if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
                     candidate.cancelled = true;
@@ -892,6 +967,12 @@ contract TTASv3 is ITTASv3, Initializable {
                 }
                 delete _liveProposalPlusOne[proposer];
             }
+        }
+    }
+
+    function _clearRemovalProposalSlot(address token, uint256 proposalId) private {
+        if (_liveRemovalProposalPlusOne[token] == proposalId + 1) {
+            delete _liveRemovalProposalPlusOne[token];
         }
     }
 

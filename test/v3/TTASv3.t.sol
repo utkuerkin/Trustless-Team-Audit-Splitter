@@ -34,8 +34,51 @@ contract TTASv3Test is TTASv3TestBase {
         assertEq(uint256(wallet.tokenState(address(0xdead))), uint256(TTASv3.TokenState.UNSUPPORTED));
 
         assertEq(factory.walletCount(), 1);
-        assertEq(factory.getDeployedWallets()[0], address(wallet));
+        assertEq(factory.walletAt(0), address(wallet));
+        address[] memory firstPage = factory.getDeployedWallets(0, 10);
+        assertEq(firstPage.length, 1);
+        assertEq(firstPage[0], address(wallet));
         assertEq(factory.implementation(), address(implementation));
+    }
+
+    function testFactoryWalletRegistryPagination() public {
+        assertEq(factory.MAX_PAGE_SIZE(), 100);
+        address walletTwo = factory.createWallet(_addrs(memberA), _nums(100_000), _addrs(address(dai)), UNANIMITY);
+        address walletThree = factory.createWallet(_addrs(memberB), _nums(100_000), _addrs(address(dai)), UNANIMITY);
+
+        assertEq(factory.walletCount(), 3);
+        assertEq(factory.walletAt(1), walletTwo);
+        assertEq(factory.walletAt(2), walletThree);
+
+        address[] memory page = factory.getDeployedWallets(1, 2);
+        assertEq(page.length, 2);
+        assertEq(page[0], walletTwo);
+        assertEq(page[1], walletThree);
+
+        page = factory.getDeployedWallets(2, type(uint256).max);
+        assertEq(page.length, 1);
+        assertEq(page[0], walletThree);
+        assertEq(factory.getDeployedWallets(0, 0).length, 0);
+        assertEq(factory.getDeployedWallets(3, 10).length, 0);
+    }
+
+    function testFactoryWalletRegistryEnforcesPageCap() public {
+        address[] memory members = _addrs(memberA);
+        uint256[] memory shares_ = _nums(100_000);
+        address[] memory tokens = _addrs(address(dai));
+        for (uint256 i = 0; i < 100; i++) {
+            factory.createWallet(members, shares_, tokens, UNANIMITY);
+        }
+
+        assertEq(factory.walletCount(), 101);
+        address[] memory firstPage = factory.getDeployedWallets(0, type(uint256).max);
+        assertEq(firstPage.length, factory.MAX_PAGE_SIZE());
+        assertEq(firstPage[0], address(wallet));
+        assertEq(firstPage[99], factory.walletAt(99));
+
+        address[] memory lastPage = factory.getDeployedWallets(100, type(uint256).max);
+        assertEq(lastPage.length, 1);
+        assertEq(lastPage[0], factory.walletAt(100));
     }
 
     function testCannotReinitializeWallet() public {

@@ -23,6 +23,10 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         vm.expectRevert(TTASv3.NotMember.selector);
         vm.prank(outsider);
         wallet.proposeRemoveToken(address(dai));
+
+        vm.expectRevert(TTASv3.NotMember.selector);
+        vm.prank(outsider);
+        wallet.proposeRetireToken(address(dai));
     }
 
     function testProposalTableIsValidatedAtCreation() public {
@@ -76,6 +80,68 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         assertEq(uint256(wallet.proposalStatus(concurrentId)), uint256(TTASv3.ProposalStatus.ACTIVE));
     }
 
+    function testRemovalProposalUsesSeparateTokenRecoveryLane() public {
+        vm.prank(memberA);
+        uint256 distributionA = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
+        vm.prank(memberB);
+        uint256 distributionB = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(70_000, 30_000));
+
+        // A's normal slot is occupied, but recovery for an active token remains
+        // available through the token-keyed removal lane.
+        vm.prank(memberA);
+        uint256 removalId = wallet.proposeRemoveToken(address(dai));
+
+        uint256[] memory liveIds = wallet.getLiveProposalIds();
+        assertEq(liveIds.length, 3);
+        assertEq(liveIds[0], distributionA);
+        assertEq(liveIds[1], distributionB);
+        assertEq(liveIds[2], removalId);
+
+        vm.expectRevert(TTASv3.ProposalStillActive.selector);
+        vm.prank(memberB);
+        wallet.proposeRemoveToken(address(dai));
+    }
+
+    function testBrokenTokenRecoveryIsAvailableWhenEveryMemberSlotIsPassed() public {
+        BreakableERC20 broken = new BreakableERC20();
+        TTASv3 brokenWallet = TTASv3(
+            factory.createWallet(
+                _addrs(memberA, memberB), _nums(SHARE_A, SHARE_B), _addrs(address(broken)), SUPERMAJORITY
+            )
+        );
+
+        vm.prank(memberA);
+        uint256 distributionA = brokenWallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
+        vm.prank(memberB);
+        uint256 distributionB = brokenWallet.proposeDistribution(_addrs(memberA, memberB), _nums(70_000, 30_000));
+
+        vm.prank(memberA);
+        brokenWallet.vote(distributionA, true);
+        vm.prank(memberB);
+        brokenWallet.vote(distributionA, true);
+        vm.prank(memberA);
+        brokenWallet.vote(distributionB, true);
+        vm.prank(memberB);
+        brokenWallet.vote(distributionB, true);
+
+        broken.setBroken(true);
+        vm.expectRevert(abi.encodeWithSelector(TTASv3.TokenUnavailable.selector, address(broken)));
+        brokenWallet.executeProposal(distributionA);
+
+        // Both normal member slots remain PASSED, but removal is not blocked.
+        vm.prank(memberA);
+        uint256 removalId = brokenWallet.proposeRemoveToken(address(broken));
+        vm.prank(memberA);
+        brokenWallet.vote(removalId, true);
+        vm.prank(memberB);
+        brokenWallet.vote(removalId, true);
+        brokenWallet.executeProposal(removalId);
+
+        assertEq(uint256(brokenWallet.tokenState(address(broken))), uint256(TTASv3.TokenState.QUARANTINED));
+        assertEq(uint256(brokenWallet.proposalStatus(distributionA)), uint256(TTASv3.ProposalStatus.PASSED));
+        assertEq(uint256(brokenWallet.proposalStatus(distributionB)), uint256(TTASv3.ProposalStatus.PASSED));
+    }
+
     function testDistributionExecutionCancelsAllOtherLiveProposals() public {
         MockERC20 op = new MockERC20("Optimism", "OP", 18);
 
@@ -83,6 +149,8 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         uint256 distributionId = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
         vm.prank(memberB);
         uint256 tokenId = wallet.proposeAddToken(address(op));
+        vm.prank(memberA);
+        uint256 removalId = wallet.proposeRemoveToken(address(dai));
 
         vm.prank(memberA);
         wallet.vote(distributionId, true);
@@ -92,11 +160,16 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         wallet.vote(tokenId, true);
         vm.prank(memberB);
         wallet.vote(tokenId, true);
+        vm.prank(memberA);
+        wallet.vote(removalId, true);
+        vm.prank(memberB);
+        wallet.vote(removalId, true);
 
         wallet.executeProposal(distributionId);
 
         assertEq(uint256(wallet.proposalStatus(distributionId)), uint256(TTASv3.ProposalStatus.EXECUTED));
         assertEq(uint256(wallet.proposalStatus(tokenId)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(uint256(wallet.proposalStatus(removalId)), uint256(TTASv3.ProposalStatus.CANCELLED));
         assertEq(wallet.getLiveProposalIds().length, 0);
         assertFalse(wallet.isSupportedToken(address(op)));
     }
@@ -160,6 +233,10 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         vm.expectRevert(TTASv3.UnsupportedToken.selector);
         vm.prank(memberA);
         wallet.proposeRemoveToken(address(0xdead));
+
+        vm.expectRevert(TTASv3.TokenNotQuarantined.selector);
+        vm.prank(memberA);
+        wallet.proposeRetireToken(address(dai));
 
         vm.expectRevert(abi.encodeWithSelector(TTASv3.TokenUnavailable.selector, address(0xdead)));
         vm.prank(memberA);

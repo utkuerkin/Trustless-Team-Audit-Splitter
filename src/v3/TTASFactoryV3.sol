@@ -16,6 +16,9 @@ import "../interfaces/ITTASv3.sol";
 contract TTASFactoryV3 {
     using Clones for address;
 
+    /// @notice Maximum number of registry entries returned by one page request.
+    uint256 public constant MAX_PAGE_SIZE = 100;
+
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -81,8 +84,25 @@ contract TTASFactoryV3 {
                              VIEW FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    function getDeployedWallets() external view returns (address[] memory) {
-        return _deployedWallets;
+    /// @notice Returns one deployed wallet by its zero-based registry index.
+    function walletAt(uint256 index) external view returns (address) {
+        return _deployedWallets[index];
+    }
+
+    /// @notice Returns up to min(`limit`, MAX_PAGE_SIZE) wallets at `offset`.
+    /// @dev An offset at or beyond walletCount(), or a zero limit, returns an empty
+    ///      page. Pagination keeps registry reads bounded as the public factory grows.
+    function getDeployedWallets(uint256 offset, uint256 limit) external view returns (address[] memory wallets) {
+        uint256 count = _deployedWallets.length;
+        if (offset >= count || limit == 0) return new address[](0);
+
+        uint256 remaining = count - offset;
+        uint256 length = limit < remaining ? limit : remaining;
+        if (length > MAX_PAGE_SIZE) length = MAX_PAGE_SIZE;
+        wallets = new address[](length);
+        for (uint256 i = 0; i < length; i++) {
+            wallets[i] = _deployedWallets[offset + i];
+        }
     }
 
     function walletCount() external view returns (uint256) {

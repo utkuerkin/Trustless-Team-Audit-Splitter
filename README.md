@@ -14,7 +14,8 @@ and share changes use share-weighted voting.
 - Allow each member to claim independently.
 - Preserve earnings accrued under an earlier share allocation.
 - Support governed membership and share changes.
-- Allow governance to retire a payment token without discarding existing claims.
+- Allow governance to quarantine and explicitly retire payment tokens without
+  discarding existing claims.
 - Allow a member to leave without requiring a team vote.
 - Support up to 10 ERC20 payment tokens per wallet.
 
@@ -43,7 +44,9 @@ cannot claim funds accounted before they joined. Removed members retain their
 settled `owed` balances.
 
 Rounding is contract-favoring. A small amount of token base-unit dust can remain
-after a share epoch changes.
+after a share epoch changes. Quarantine settlement uses cumulative frozen-share
+entitlements, so splitting the same payment across multiple settlement calls
+cannot change any member's allocation.
 
 ## User operations
 
@@ -69,10 +72,13 @@ individually by address.
 table. Shares must sum to 100,000. Adding a member, removing a member, and
 changing allocations use the same proposal type.
 
-Each member may have one live proposal. Up to 12 proposals can therefore be
-active concurrently. Votes are weighted by current shares. A successful
-distribution change cancels every other live proposal because their recorded
-vote weights belong to the previous share table.
+Each member may have one live distribution, token-addition, or retirement
+proposal. Recoverable token-removal proposals use a separate lane keyed by the
+active token, with at most one live removal proposal per token. This keeps
+broken-token recovery available even when every member's normal proposal slot is
+occupied. Votes are weighted by current shares. A successful distribution change
+cancels every other live proposal because their recorded vote weights belong to
+the previous share table.
 
 Execution fails if any active token cannot provide a valid balance. The share
 table and proposal state remain unchanged. Remove or recover the affected token
@@ -88,28 +94,27 @@ of 10 active tokens.
 An existing balance at the newly added token address becomes distributable
 after the token is added.
 
-`proposeRemoveToken(token)` proposes permanent removal from the active token
-set. Execution has two outcomes:
-
-- A readable token is synchronized, current accrual is moved to `owed`, and the
-  token becomes `RETIRED`.
-- An unreadable token is removed from active use and becomes `QUARANTINED`.
-  Current members and shares are frozen for that token.
-
-Which outcome occurs is decided by whether `balanceOf` responds at the moment
-`executeProposal` is mined, not when the proposal was created or voted on. Only
-`QUARANTINED` keeps later balances recoverable. Do not remove a token that may
-still receive a payout: retire a token only after every expected payment to that
-address has arrived and been claimed. If a payment is still outstanding, keep the
-token active, or recover it and settle before removing it.
+`proposeRemoveToken(token)` proposes removing an active token into recoverable
+quarantine. Execution always freezes the current member table and sets the token
+to `QUARANTINED`. If the token is readable, its current balance is synchronized
+first. If it is unreadable, already-accounted claims are preserved and the
+unknown balance is handled after recovery. Executor timing cannot change this
+outcome.
 
 Once a quarantined token becomes readable, anyone may call
 `settleQuarantinedToken(token)`. Previously accounted claims are unchanged. Only
 the unaccounted balance is allocated using the frozen shares. Settlement is
 repeatable and the token remains `QUARANTINED`, so an early zero-value call
-cannot strand a delayed payout. Each call allocates whole base units only and
-carries the pro-rata remainder forward to the next call, so splitting a payout
-across many settlements does not discard funds.
+cannot strand a delayed payout. Each member's credit is the increase in their
+cumulative frozen-share entitlement. Settlement cadence therefore cannot alter
+the allocation.
+
+`proposeRetireToken(token)` proposes an irreversible transition from
+`QUARANTINED` to `RETIRED`. Retirement execution first settles every balance
+visible at that moment. Existing claims remain available, but later transfers
+are intentionally excluded from accounting. Once the proposal passes, anyone
+can execute it immediately. Do not pass a retirement proposal while a payment
+is still expected; a transfer mined after retirement is permanently stranded.
 
 Removal frees one active token slot. A quarantined or retired address cannot be
 added again because its earlier accounting remains stored.
@@ -173,12 +178,14 @@ depend on its current balance revert with `TokenUnavailable`, including `sync`,
 `claim` for that token, `claimAll`, distribution execution, and `leave`.
 Individual claims for other readable tokens still work.
 
-Governance can remove the token while it is unreadable. Removal preserves
-already-accounted claims and freezes the current shares for funds that could not
-be measured. Share changes and `leave()` can continue after removal. Funds sent
-while the token is quarantined are also assigned using the frozen shares on the
-next settlement. Quarantine does not close after settlement, so later balances
-remain recoverable under the same frozen table.
+Governance can remove the token while it is unreadable. Removal proposals use a
+token-keyed recovery lane, so unrelated proposals occupying every member slot do
+not delay this path. Removal preserves already-accounted claims and freezes the
+current shares for funds that could not be measured. Share changes and `leave()`
+can continue after removal. Funds sent while the token is quarantined are also
+assigned using the frozen shares on the next settlement. Quarantine does not
+close after settlement, so later balances remain recoverable under the same
+frozen table.
 Already-accounted `owed` balances can still be claimed during quarantine if the
 token's transfer function works.
 
@@ -191,8 +198,11 @@ Isolation remains incomplete in two important cases:
 
 Do not send funds to a token after it becomes `RETIRED`. Retired tokens are
 permanently excluded from accounting, so later transfers to the wallet are
-stranded. A quarantined token remains recoverable, but every later transfer uses
-the shares frozen at removal.
+stranded. Retirement is a separate governance decision and settles visible funds
+before taking effect. Passing that decision is the cutoff authorization:
+execution is permissionless and does not wait for an expected payment. A
+quarantined token remains recoverable, but every later transfer uses the shares
+frozen at removal.
 
 ## Delayed and overlapping payouts
 
@@ -222,6 +232,10 @@ synchronized.
 Version 1 used a fixed-share push distribution. The abandoned version 2
 development branch used per-payment snapshots. Version 3 replaces that design
 with accumulator accounting and pull-based claims.
+
+The public factory registry is paginated. Use `walletCount()` for its length,
+`walletAt(index)` for one entry, or `getDeployedWallets(offset, limit)` for a
+bounded page of at most 100 entries.
 
 ## Development
 
