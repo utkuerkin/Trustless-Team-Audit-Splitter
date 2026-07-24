@@ -55,11 +55,22 @@ contract TTASv3Test is TTASv3TestBase {
     function testInitRejectsDuplicateMembers() public {
         vm.expectRevert(TTASv3.DuplicateMember.selector);
         factory.createWallet(
-            _addrs(memberA, memberA, memberB),
-            _nums(20_000, 40_000, 40_000),
-            _addrs(address(dai)),
-            UNANIMITY
+            _addrs(memberA, memberA, memberB), _nums(20_000, 40_000, 40_000), _addrs(address(dai)), UNANIMITY
         );
+    }
+
+    function testInitializationRejectsWalletAsMember() public {
+        uint64 factoryNonce = vm.getNonce(address(factory));
+        address nextWallet = vm.computeCreateAddress(address(factory), factoryNonce);
+
+        vm.expectRevert(TTASv3.SelfMember.selector);
+        factory.createWallet(_addrs(nextWallet), _nums(100_000), _addrs(address(dai)), UNANIMITY);
+    }
+
+    function testDistributionProposalRejectsWalletAsMember() public {
+        vm.expectRevert(TTASv3.SelfMember.selector);
+        vm.prank(memberA);
+        wallet.proposeDistribution(_addrs(memberA, address(wallet)), _nums(60_000, 40_000));
     }
 
     function testInitValidation() public {
@@ -199,12 +210,17 @@ contract TTASv3Test is TTASv3TestBase {
 
     function testUnsupportedTokenReverts() public {
         MockERC20 other = new MockERC20("OTHER", "OTHER", 18);
+        other.mint(address(wallet), 100e18);
+
         vm.expectRevert(TTASv3.UnsupportedToken.selector);
         wallet.sync(address(other));
 
         vm.expectRevert(TTASv3.UnsupportedToken.selector);
         vm.prank(memberA);
         wallet.claim(address(other));
+
+        vm.expectRevert(TTASv3.UnsupportedToken.selector);
+        wallet.claimable(memberA, address(other));
     }
 
     /// @dev Regression: v1 pushed to every member in one loop, so a single
@@ -214,10 +230,7 @@ contract TTASv3Test is TTASv3TestBase {
         BlocklistERC20 blockToken = new BlocklistERC20();
         TTASv3 blockWallet = TTASv3(
             factory.createWallet(
-                _addrs(memberA, memberB),
-                _nums(SHARE_A, SHARE_B),
-                _addrs(address(blockToken)),
-                SUPERMAJORITY
+                _addrs(memberA, memberB), _nums(SHARE_A, SHARE_B), _addrs(address(blockToken)), SUPERMAJORITY
             )
         );
 
@@ -244,10 +257,7 @@ contract TTASv3Test is TTASv3TestBase {
         // 100 wei split 3 ways can strand at most a wei or two — never more.
         TTASv3 threeWallet = TTASv3(
             factory.createWallet(
-                _addrs(memberA, memberB, memberC),
-                _nums(33_333, 33_333, 33_334),
-                _addrs(address(dai)),
-                SUPERMAJORITY
+                _addrs(memberA, memberB, memberC), _nums(33_333, 33_333, 33_334), _addrs(address(dai)), SUPERMAJORITY
             )
         );
         dai.mint(address(threeWallet), 100);
@@ -263,6 +273,86 @@ contract TTASv3Test is TTASv3TestBase {
         assertEq(dai.balanceOf(memberB), 33);
         assertEq(dai.balanceOf(memberC), 33);
         assertLe(dai.balanceOf(address(threeWallet)), 1);
+    }
+
+    /// @dev Regression: token-unit reward debt floored both sides of a share change.
+    ///      The difference of those floors could exceed the wallet balance by 1.
+    function testDistributionChangeCannotCreateRoundingDeficit() public {
+        TTASv3 threeWallet = TTASv3(
+            factory.createWallet(
+                _addrs(memberA, memberB, memberC), _nums(50_000, 25_000, 25_000), _addrs(address(dai)), SUPERMAJORITY
+            )
+        );
+
+        dai.mint(address(threeWallet), 2);
+
+        vm.prank(memberA);
+        uint256 id = threeWallet.proposeDistribution(_addrs(memberA, memberB, memberC), _nums(33_334, 33_333, 33_333));
+        vm.prank(memberA);
+        threeWallet.vote(id, true);
+        vm.prank(memberB);
+        threeWallet.vote(id, true);
+        threeWallet.executeProposal(id);
+
+        dai.mint(address(threeWallet), 99_998);
+
+        uint256 liabilities = threeWallet.claimable(memberA, address(dai))
+            + threeWallet.claimable(memberB, address(dai)) + threeWallet.claimable(memberC, address(dai));
+        assertLe(liabilities, dai.balanceOf(address(threeWallet)));
+        assertEq(liabilities, 99_998);
+
+        vm.prank(memberA);
+        threeWallet.claim(address(dai));
+        vm.prank(memberB);
+        threeWallet.claim(address(dai));
+        vm.prank(memberC);
+        threeWallet.claim(address(dai));
+        assertEq(dai.balanceOf(address(threeWallet)), 2);
+    }
+
+    function testScaledDebtPreservesRemainderAcrossClaims() public {
+        dai.mint(address(wallet), 2);
+        assertEq(_claim(memberA, address(dai)), 1);
+
+        dai.mint(address(wallet), 3);
+        assertEq(_claim(memberA, address(dai)), 2);
+        assertEq(_claim(memberB, address(dai)), 2);
+
+        assertEq(dai.balanceOf(memberA), 3);
+        assertEq(dai.balanceOf(memberB), 2);
+        assertEq(dai.balanceOf(address(wallet)), 0);
+    }
+
+    function testFuzz_DistributionChangeRemainsSolvent(
+        uint256 oldShareA,
+        uint256 newShareA,
+        uint256 beforeAmount,
+        uint256 afterAmount
+    ) public {
+        oldShareA = bound(oldShareA, 1, 99_999);
+        newShareA = bound(newShareA, 1, 99_999);
+        beforeAmount = bound(beforeAmount, 0, 1e24);
+        afterAmount = bound(afterAmount, 0, 1e24);
+
+        TTASv3 fuzzWallet = TTASv3(
+            factory.createWallet(
+                _addrs(memberA, memberB), _nums(oldShareA, 100_000 - oldShareA), _addrs(address(dai)), UNANIMITY
+            )
+        );
+        dai.mint(address(fuzzWallet), beforeAmount);
+
+        vm.prank(memberA);
+        uint256 id = fuzzWallet.proposeDistribution(_addrs(memberA, memberB), _nums(newShareA, 100_000 - newShareA));
+        vm.prank(memberA);
+        fuzzWallet.vote(id, true);
+        vm.prank(memberB);
+        fuzzWallet.vote(id, true);
+        fuzzWallet.executeProposal(id);
+
+        dai.mint(address(fuzzWallet), afterAmount);
+
+        uint256 liabilities = fuzzWallet.claimable(memberA, address(dai)) + fuzzWallet.claimable(memberB, address(dai));
+        assertLe(liabilities, dai.balanceOf(address(fuzzWallet)));
     }
 
     function testFuzz_ConservationAndSolvency(uint256 a, uint256 b, uint256 c) public {
@@ -316,10 +406,7 @@ contract TTASv3Test is TTASv3TestBase {
     function testLeaveRedistributionRounding() public {
         TTASv3 threeWallet = TTASv3(
             factory.createWallet(
-                _addrs(memberA, memberB, memberC),
-                _nums(40_000, 30_000, 30_000),
-                _addrs(address(dai)),
-                SUPERMAJORITY
+                _addrs(memberA, memberB, memberC), _nums(40_000, 30_000, 30_000), _addrs(address(dai)), SUPERMAJORITY
             )
         );
 
@@ -350,18 +437,21 @@ contract TTASv3Test is TTASv3TestBase {
 
     function testLeaveCancelsLiveProposal() public {
         vm.prank(memberA);
-        uint256 id = wallet.proposeDistribution(
-            _addrs(memberA, memberB, memberC),
-            _nums(40_000, 30_000, 30_000)
-        );
+        uint256 distributionId =
+            wallet.proposeDistribution(_addrs(memberA, memberB, memberC), _nums(40_000, 30_000, 30_000));
+        MockERC20 op = new MockERC20("Optimism", "OP", 18);
+        vm.prank(memberB);
+        uint256 tokenId = wallet.proposeAddToken(address(op));
 
         vm.prank(memberB);
         wallet.leave();
 
-        assertEq(uint256(wallet.proposalStatus(id)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(uint256(wallet.proposalStatus(distributionId)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(uint256(wallet.proposalStatus(tokenId)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(wallet.getLiveProposalIds().length, 0);
 
         vm.expectRevert(TTASv3.ProposalNotActive.selector);
         vm.prank(memberA);
-        wallet.vote(id, true);
+        wallet.vote(distributionId, true);
     }
 }

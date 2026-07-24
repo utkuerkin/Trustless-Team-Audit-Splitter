@@ -50,23 +50,33 @@ contract TTASv3StressTest is Test {
             assigned += newShares[i];
         }
 
-        vm.prank(members[0]);
-        uint256 id = w.proposeDistribution(newMembers, newShares);
+        // Every member occupies their bounded live-proposal slot. The proposal
+        // selected for execution must cancel the other eleven before changing
+        // vote weights, so this also exercises worst-case governance cleanup.
+        uint256[] memory proposalIds = new uint256[](12);
         for (uint256 i = 0; i < 12; i++) {
             vm.prank(members[i]);
-            w.vote(id, true);
+            proposalIds[i] = w.proposeDistribution(newMembers, newShares);
+        }
+        for (uint256 i = 0; i < 12; i++) {
+            vm.prank(members[i]);
+            w.vote(proposalIds[0], true);
         }
 
         uint256 gasBefore = gasleft();
-        w.executeProposal(id);
+        w.executeProposal(proposalIds[0]);
         uint256 used = gasBefore - gasleft();
 
         emit log_named_uint("executeProposal gas (12 members x 10 tokens)", used);
-        // ~6.8M: dominated by ~240 cold storage writes (settle owed + rebaseline
+        // Dominated by cold storage writes (settle owed + rebaseline scaled
         // rewardDebt across 12 members x 10 tokens). Crucially BOUNDED by the
         // MAX_MEMBERS/MAX_TOKENS caps — it cannot grow with usage the way v2's
         // per-payment snapshot loops did. Rare governance action; well under the
         // ~30M mainnet block limit and negligible on L2.
         assertLt(used, 12_000_000, "worst-case distribution must stay safely under block limit");
+        assertEq(w.getLiveProposalIds().length, 0);
+        for (uint256 i = 1; i < 12; i++) {
+            assertEq(uint256(w.proposalStatus(proposalIds[i])), uint256(TTASv3.ProposalStatus.CANCELLED));
+        }
     }
 }

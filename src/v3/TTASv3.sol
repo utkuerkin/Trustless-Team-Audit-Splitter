@@ -14,36 +14,48 @@ pragma solidity ^0.8.24;
 ///        totalAccounted   lifetime tokens absorbed into accPerShare
 ///        totalReleased    lifetime tokens paid out to members
 ///        new funds        = balanceOf(this) + totalReleased - totalAccounted
-///        accrued(m)       = shares(m) * accPerShare - rewardDebt(m)
+///        grossScaled(m)   = shares(m) * accPerShare
+///        accrued(m)       = (grossScaled(m) - rewardDebt(m)) / ACC_PRECISION
 ///
 ///      Whenever the share table changes (proposal execution or leave()) every
 ///      member's accrued amount is settled into `owed` first, so past earnings are
 ///      locked in at the old shares and future earnings accrue at the new ones.
-///      New members start with rewardDebt equal to the current accumulator, so they
+///      rewardDebt is stored in scaled units. Subtraction therefore happens before
+///      division, so independent floor operations across a share change can never
+///      create more liabilities than the wallet owns. New members start with debt
+///      equal to their exact scaled entitlement at the current accumulator, so they
 ///      can never claim funds that arrived before they joined. Removed members keep
 ///      their `owed` balance and can claim it at any time.
 ///
-///      Solvency invariant: for every token,
+///      Solvency invariant for standard, non-rebasing ERC20s: for every token,
 ///        balanceOf(this) >= sum(owed) + sum(accrued) (up to wei-level rounding dust).
-///      Rounding always favours the contract (members are floored), so the wallet
-///      can never become insolvent; a few wei of dust per distribution change is
-///      unrecoverable by design.
+///      Rounding always favours the contract (members are floored once per share
+///      epoch), so the wallet cannot become insolvent from accounting; a few wei of
+///      dust per distribution change is unrecoverable by design.
 ///
 ///      Token assumptions. Best with standard fixed-supply ERC20s (USDC, USDT,
-///      DAI, WETH, ...). Degradation, not catastrophe, on non-standard tokens:
+///      DAI, WETH, ...). Compatibility details and failure modes:
 ///        - fee-on-transfer: only the amount that actually lands is credited
 ///          (balance-based), so accounting stays consistent; claimers just bear
 ///          the token's fee.
 ///        - rebasing: a negative rebase reads as zero new funds and can leave the
 ///          last claimers of that token short. Avoid rebasing tokens.
-///        - a token that later breaks (reverting balanceOf/transfer): confined to
-///          that token — its funds may be frozen, but other tokens, governance and
-///          leave() keep working. There is no token-removal path, so a broken
-///          token stays whitelisted (harmlessly).
+///        - a token that later reverts in balanceOf: the revert is caught, so an
+///          ordinary pause/break does not freeze other tokens, governance or
+///          leave(). This isolation is not absolute: a hostile balanceOf can consume
+///          nearly all forwarded gas or return arithmetic-extreme values, which can
+///          still make operations that sync every token revert. Only whitelist
+///          vetted tokens. There is no token-removal path.
 ///        - blocklist tokens (USDC-style): a member blocked by the token issuer
 ///          cannot receive that token; their balance in it is stranded (no admin
 ///          rescue exists). Their other tokens are unaffected.
 ///      Native ETH is not supported — use WETH.
+///
+///      Payout attribution limitation. Direct ERC20 transfers carry no contest or
+///      epoch identifier. A payment is therefore split using the share table in
+///      force when it arrives, even if it belongs to an older contest. Use a fresh
+///      cheap clone per contest/payout agreement when delayed or overlapping payouts
+///      could otherwise be assigned to the wrong team composition.
 ///
 ///      Governance trust model. This is a semi-trusted small-team tool, not a
 ///      trustless DAO. Voting is share-weighted and the approval threshold is fixed
@@ -54,10 +66,11 @@ pragma solidity ^0.8.24;
 ///          lost/dark key can deadlock all future membership changes; a member's
 ///          only guaranteed escape is leave(). Prefer a supermajority over
 ///          unanimity unless every member's key liveness is assured.
-///        - One proposal is live at a time. A member can occupy that slot with junk
-///          proposals to add friction, but an honest majority can always defeat a
-///          junk proposal and push its own through, so this is griefing, not
-///          capture. Already-earned funds (owed) are always claimable regardless.
+///        - Each member may have at most one live proposal, so up to MAX_MEMBERS
+///          proposals may proceed concurrently. This prevents one minority member
+///          from monopolizing a global proposal slot. Any membership change cancels
+///          every other live proposal because its recorded vote weights are stale.
+///          Already-earned funds (owed) are always claimable regardless.
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -72,25 +85,34 @@ contract TTASv3 is ITTASv3, Initializable {
     //////////////////////////////////////////////////////////////*/
 
     enum ProposalType {
-        DISTRIBUTION, // replace the entire member/share table
-        ADD_TOKEN     // whitelist an additional payment token
+        // Replace the entire member/share table.
+        DISTRIBUTION,
+        // Whitelist an additional payment token.
+        ADD_TOKEN
     }
 
     enum ProposalStatus {
-        NONE,      // no proposal with this id
-        ACTIVE,    // voting open
-        PASSED,    // threshold reached, awaiting execution (until deadline)
+        // No proposal with this id.
+        NONE,
+        // Voting is open.
+        ACTIVE,
+        // Threshold reached, awaiting execution until the deadline.
+        PASSED,
         EXECUTED,
-        DEFEATED,  // enough votes against that it can no longer pass
-        EXPIRED,   // deadline passed without execution
-        CANCELLED  // invalidated by a membership change (leave())
+        // Enough votes oppose it that it can no longer pass.
+        DEFEATED,
+        // Deadline passed without execution.
+        EXPIRED,
+        // Invalidated by a membership or token-list change.
+        CANCELLED
     }
 
     struct Proposal {
         ProposalType proposalType;
-        address token;     // ADD_TOKEN proposals only
+        address proposer;
+        address token; // ADD_TOKEN proposals only
         address[] members; // DISTRIBUTION proposals only
-        uint256[] shares;  // DISTRIBUTION proposals only
+        uint256[] shares; // DISTRIBUTION proposals only
         uint64 deadline;
         uint256 votesFor;
         uint256 votesAgainst;
@@ -103,6 +125,7 @@ contract TTASv3 is ITTASv3, Initializable {
     ///      derived status, for getProposal().
     struct ProposalView {
         ProposalType proposalType;
+        address proposer;
         address token;
         address[] members;
         uint256[] shares;
@@ -123,6 +146,7 @@ contract TTASv3 is ITTASv3, Initializable {
     error ZeroAddress();
     error ZeroShares();
     error DuplicateMember();
+    error SelfMember();
     error InvalidShareTotal();
     error NoTokens();
     error TooManyTokens();
@@ -171,7 +195,9 @@ contract TTASv3 is ITTASv3, Initializable {
     mapping(address => uint256) public accPerShare;
     mapping(address => uint256) public totalAccounted;
     mapping(address => uint256) public totalReleased;
-    /// @dev member => token => accumulator debt at the member's last settlement
+    /// @dev member => token => scaled entitlement already accounted for.
+    ///      Unlike token-unit debt, scaled debt lets _accrued() subtract before
+    ///      flooring and prevents cross-distribution rounding deficits.
     mapping(address => mapping(address => uint256)) public rewardDebt;
     /// @dev account => token => settled amount claimable at any time (survives removal)
     mapping(address => mapping(address => uint256)) public owed;
@@ -180,9 +206,12 @@ contract TTASv3 is ITTASv3, Initializable {
     ///         strictly more than 50% and at most 100_000 = unanimity)
     uint256 public approvalThreshold;
 
-    /// @notice Total number of proposals ever created; the votable one is the latest
+    /// @notice Total number of proposals ever created
     uint256 public proposalCount;
     mapping(uint256 => Proposal) private _proposals;
+    /// @dev proposer => proposal id + 1. Entries for terminal proposals are cleared
+    ///      lazily when the proposer creates again or eagerly on invalidation.
+    mapping(address => uint256) private _liveProposalPlusOne;
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -296,10 +325,11 @@ contract TTASv3 is ITTASv3, Initializable {
     ///         member and changing percentages are all the same operation: list the
     ///         desired members with shares summing to 100_000. Anyone omitted is
     ///         removed (their already-earned funds stay claimable forever).
-    function proposeDistribution(
-        address[] calldata members,
-        uint256[] calldata shares_
-    ) external onlyMember returns (uint256 proposalId) {
+    function proposeDistribution(address[] calldata members, uint256[] calldata shares_)
+        external
+        onlyMember
+        returns (uint256 proposalId)
+    {
         _validateDistribution(members, shares_);
         proposalId = _createProposal(ProposalType.DISTRIBUTION);
         Proposal storage p = _proposals[proposalId];
@@ -320,8 +350,8 @@ contract TTASv3 is ITTASv3, Initializable {
     }
 
     /// @notice Casts a share-weighted vote on the active proposal. Share weights
-    ///         cannot change while a proposal is active (execution and leave() both
-    ///         end it), so vote weights are always consistent.
+    ///         cannot change without cancelling every other live proposal, so vote
+    ///         weights remain consistent even with concurrent proposals.
     function vote(uint256 proposalId, bool support) external onlyMember {
         if (proposalStatus(proposalId) != ProposalStatus.ACTIVE) revert ProposalNotActive();
         Proposal storage p = _proposals[proposalId];
@@ -346,22 +376,27 @@ contract TTASv3 is ITTASv3, Initializable {
         p.executed = true;
 
         if (p.proposalType == ProposalType.DISTRIBUTION) {
+            // The executing proposal is already EXECUTED and is therefore skipped;
+            // every other live proposal used the old vote weights and is cancelled.
+            _cancelAllLiveProposals();
             _applyDistribution(p.members, p.shares);
         } else {
             _addToken(p.token);
+            _clearProposalSlot(p.proposer, proposalId);
+            _cancelInvalidTokenProposals(p.token);
         }
         emit ProposalExecuted(proposalId);
     }
 
     /// @notice Leaves the team unilaterally. The caller's accrued earnings are
     ///         settled (claimable forever via claim()), their shares are
-    ///         redistributed pro-rata to the remaining members, and any live
+    ///         redistributed pro-rata to the remaining members, and every live
     ///         proposal is cancelled since its vote weights are stale.
     function leave() external onlyMember {
         uint256 len = _memberList.length;
         if (len == 1) revert LastMemberCannotLeave();
 
-        _cancelLiveProposal();
+        _cancelAllLiveProposals();
 
         uint256 remaining = MAX_TOTAL_SHARES - _shares[msg.sender];
         address[] memory newMembers = new address[](len - 1);
@@ -410,15 +445,41 @@ contract TTASv3 is ITTASv3, Initializable {
     /// @notice Everything `account` could claim in `token` right now, including
     ///         funds received but not yet synced.
     function claimable(address account, address token) external view returns (uint256) {
+        if (!isSupportedToken[token]) revert UnsupportedToken();
         uint256 acc = accPerShare[token];
         uint256 newFunds = _newFunds(token);
         if (newFunds > 0) {
             acc += (newFunds * ACC_PRECISION) / MAX_TOTAL_SHARES;
         }
-        uint256 entitled = (_shares[account] * acc) / ACC_PRECISION;
+        uint256 grossScaled = _shares[account] * acc;
         uint256 debt = rewardDebt[account][token];
-        uint256 accrued = entitled > debt ? entitled - debt : 0;
+        uint256 accrued = grossScaled > debt ? (grossScaled - debt) / ACC_PRECISION : 0;
         return owed[account][token] + accrued;
+    }
+
+    /// @notice IDs of all currently ACTIVE or PASSED proposals. At most one entry
+    ///         exists per current member, so both loops are bounded by MAX_MEMBERS.
+    function getLiveProposalIds() external view returns (uint256[] memory ids) {
+        uint256 memberCount = _memberList.length;
+        uint256 count;
+        for (uint256 i = 0; i < memberCount; i++) {
+            uint256 plusOne = _liveProposalPlusOne[_memberList[i]];
+            if (plusOne == 0) continue;
+            ProposalStatus status = proposalStatus(plusOne - 1);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) count++;
+        }
+
+        ids = new uint256[](count);
+        uint256 k;
+        for (uint256 i = 0; i < memberCount; i++) {
+            uint256 plusOne = _liveProposalPlusOne[_memberList[i]];
+            if (plusOne == 0) continue;
+            uint256 proposalId = plusOne - 1;
+            ProposalStatus status = proposalStatus(proposalId);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                ids[k++] = proposalId;
+            }
+        }
     }
 
     function proposalStatus(uint256 proposalId) public view returns (ProposalStatus) {
@@ -438,6 +499,7 @@ contract TTASv3 is ITTASv3, Initializable {
         Proposal storage p = _proposals[proposalId];
         return ProposalView({
             proposalType: p.proposalType,
+            proposer: p.proposer,
             token: p.token,
             members: p.members,
             shares: p.shares,
@@ -456,16 +518,17 @@ contract TTASv3 is ITTASv3, Initializable {
                           INTERNAL: ACCOUNTING
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Funds received since the last sync. Hardened two ways:
+    /// @dev Funds received since the last sync. Hardened against two common failures:
     ///      - A balance DROP (rebasing/deflationary token) reads as zero new funds
     ///        instead of underflow-reverting (which is what bricked v2).
     ///      - A balanceOf that REVERTS (a token later paused, upgraded to revert, or
     ///        pointed at a self-destructed impl) reads as zero new funds instead of
     ///        propagating. Because sync() runs over every token inside
-    ///        _applyDistribution, leave() and claimAll(), an unguarded revert here
-    ///        would permanently freeze all membership changes and exits. With the
-    ///        catch, a single broken token degrades to "no new funds" and the rest
-    ///        of the wallet — other tokens, governance, leave() — keeps working.
+    ///        _applyDistribution, leave() and claimAll(), an unguarded ordinary
+    ///        revert here would freeze membership changes and exits.
+    ///      This is deliberately not described as complete malicious-token isolation:
+    ///      the external call has no gas cap, and arithmetic-extreme successful
+    ///      return values can still revert inside this function or _sync().
     function _newFunds(address token) private view returns (uint256) {
         try IERC20(token).balanceOf(address(this)) returns (uint256 bal) {
             uint256 totalIn = bal + totalReleased[token];
@@ -486,9 +549,9 @@ contract TTASv3 is ITTASv3, Initializable {
 
     /// @dev Accumulator earnings of `account` in `token` since their last settlement.
     function _accrued(address account, address token) private view returns (uint256) {
-        uint256 entitled = (_shares[account] * accPerShare[token]) / ACC_PRECISION;
+        uint256 grossScaled = _shares[account] * accPerShare[token];
         uint256 debt = rewardDebt[account][token];
-        return entitled > debt ? entitled - debt : 0;
+        return grossScaled > debt ? (grossScaled - debt) / ACC_PRECISION : 0;
     }
 
     /// @dev Moves everything `account` is entitled to (settled + accrued) out of the
@@ -496,7 +559,9 @@ contract TTASv3 is ITTASv3, Initializable {
     function _harvest(address account, address token) private returns (uint256 amount) {
         uint256 accrued = _accrued(account, token);
         if (accrued > 0) {
-            rewardDebt[account][token] = (_shares[account] * accPerShare[token]) / ACC_PRECISION;
+            // Advance by whole paid units only. Any sub-token scaled remainder is
+            // retained and can combine with later deposits while shares stay fixed.
+            rewardDebt[account][token] += accrued * ACC_PRECISION;
         }
         amount = accrued + owed[account][token];
         if (owed[account][token] > 0) {
@@ -521,13 +586,13 @@ contract TTASv3 is ITTASv3, Initializable {
             _sync(_tokenList[i]);
         }
 
-        // 2. Settle every current member's accrued earnings into `owed`, then zero
-        //    their shares. We deliberately do NOT reset rewardDebt here: a removed
-        //    member has shares == 0, so _accrued() returns 0 for them regardless of
-        //    any stale debt, and a member who stays (or is re-added) has their debt
-        //    freshly rebaselined in step 3. Skipping the reset halves the storage
-        //    writes on the hot path.
-        for (uint256 i = 0; i < _memberList.length; i++) {
+        // 2. Settle every current member's whole-token accrued earnings into `owed`,
+        //    then zero their shares. Any sub-token scaled remainder is deliberately
+        //    left as contract-favouring dust at the epoch boundary. We do NOT reset
+        //    rewardDebt here: removed members have shares == 0, while members who
+        //    stay or are re-added are freshly rebaselined in step 3.
+        uint256 oldMemberCount = _memberList.length;
+        for (uint256 i = 0; i < oldMemberCount; i++) {
             address member = _memberList[i];
             for (uint256 j = 0; j < tokenCount; j++) {
                 address token = _tokenList[j];
@@ -540,8 +605,9 @@ contract TTASv3 is ITTASv3, Initializable {
         }
         delete _memberList;
 
-        // 3. Install the new table; baseline everyone's debt at the current
-        //    accumulator so nobody picks up earnings from before this point.
+        // 3. Install the new table; baseline everyone's debt at the exact scaled
+        //    entitlement. Subtracting at scaled precision before later flooring is
+        //    what prevents independent floor operations from creating insolvency.
         for (uint256 i = 0; i < newMembers.length; i++) {
             address member = newMembers[i];
             uint256 share = newShares[i];
@@ -549,7 +615,7 @@ contract TTASv3 is ITTASv3, Initializable {
             _memberList.push(member);
             for (uint256 j = 0; j < tokenCount; j++) {
                 address token = _tokenList[j];
-                rewardDebt[member][token] = (share * accPerShare[token]) / ACC_PRECISION;
+                rewardDebt[member][token] = share * accPerShare[token];
             }
             emit SharesSet(member, share);
         }
@@ -560,8 +626,9 @@ contract TTASv3 is ITTASv3, Initializable {
     //////////////////////////////////////////////////////////////*/
 
     function _createProposal(ProposalType proposalType) private returns (uint256 proposalId) {
-        if (proposalCount > 0) {
-            ProposalStatus status = proposalStatus(proposalCount - 1);
+        uint256 previousPlusOne = _liveProposalPlusOne[msg.sender];
+        if (previousPlusOne > 0) {
+            ProposalStatus status = proposalStatus(previousPlusOne - 1);
             if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
                 revert ProposalStillActive();
             }
@@ -569,17 +636,55 @@ contract TTASv3 is ITTASv3, Initializable {
         proposalId = proposalCount++;
         Proposal storage p = _proposals[proposalId];
         p.proposalType = proposalType;
+        p.proposer = msg.sender;
         p.deadline = uint64(block.timestamp + VOTING_PERIOD);
+        _liveProposalPlusOne[msg.sender] = proposalId + 1;
         emit ProposalCreated(proposalId, msg.sender, proposalType);
     }
 
-    function _cancelLiveProposal() private {
-        if (proposalCount == 0) return;
-        uint256 latest = proposalCount - 1;
-        ProposalStatus status = proposalStatus(latest);
-        if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
-            _proposals[latest].cancelled = true;
-            emit ProposalCancelled(latest);
+    /// @dev Cancels every live proposal whose votes use the current share table.
+    ///      One-live-proposal-per-member bounds this loop by MAX_MEMBERS.
+    function _cancelAllLiveProposals() private {
+        uint256 memberCount = _memberList.length;
+        for (uint256 i = 0; i < memberCount; i++) {
+            address proposer = _memberList[i];
+            uint256 plusOne = _liveProposalPlusOne[proposer];
+            if (plusOne == 0) continue;
+            uint256 proposalId = plusOne - 1;
+            ProposalStatus status = proposalStatus(proposalId);
+            if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                _proposals[proposalId].cancelled = true;
+                emit ProposalCancelled(proposalId);
+            }
+            delete _liveProposalPlusOne[proposer];
+        }
+    }
+
+    /// @dev Adding a token invalidates concurrent proposals for the same token.
+    ///      Reaching MAX_TOKENS invalidates every remaining ADD_TOKEN proposal.
+    function _cancelInvalidTokenProposals(address addedToken) private {
+        bool tokenListFull = _tokenList.length >= MAX_TOKENS;
+        uint256 memberCount = _memberList.length;
+        for (uint256 i = 0; i < memberCount; i++) {
+            address proposer = _memberList[i];
+            uint256 plusOne = _liveProposalPlusOne[proposer];
+            if (plusOne == 0) continue;
+            uint256 proposalId = plusOne - 1;
+            Proposal storage candidate = _proposals[proposalId];
+            if (candidate.proposalType == ProposalType.ADD_TOKEN && (candidate.token == addedToken || tokenListFull)) {
+                ProposalStatus status = proposalStatus(proposalId);
+                if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                    candidate.cancelled = true;
+                    emit ProposalCancelled(proposalId);
+                }
+                delete _liveProposalPlusOne[proposer];
+            }
+        }
+    }
+
+    function _clearProposalSlot(address proposer, uint256 proposalId) private {
+        if (_liveProposalPlusOne[proposer] == proposalId + 1) {
+            delete _liveProposalPlusOne[proposer];
         }
     }
 
@@ -590,12 +695,13 @@ contract TTASv3 is ITTASv3, Initializable {
     function _addToken(address token) private {
         if (token == address(0)) revert ZeroAddress();
         if (isSupportedToken[token]) revert DuplicateToken();
+        if (_tokenList.length >= MAX_TOKENS) revert TooManyTokens();
         isSupportedToken[token] = true;
         _tokenList.push(token);
         emit TokenAdded(token);
     }
 
-    function _validateDistribution(address[] calldata members, uint256[] calldata shares_) private pure {
+    function _validateDistribution(address[] calldata members, uint256[] calldata shares_) private view {
         uint256 len = members.length;
         if (len == 0) revert NoMembers();
         if (len > MAX_MEMBERS) revert TooManyMembers();
@@ -604,6 +710,7 @@ contract TTASv3 is ITTASv3, Initializable {
         uint256 total;
         for (uint256 i = 0; i < len; i++) {
             if (members[i] == address(0)) revert ZeroAddress();
+            if (members[i] == address(this)) revert SelfMember();
             if (shares_[i] == 0) revert ZeroShares();
             for (uint256 j = 0; j < i; j++) {
                 if (members[i] == members[j]) revert DuplicateMember();

@@ -31,16 +31,28 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         wallet.proposeDistribution(_addrs(memberA, memberA), _nums(60_000, 40_000));
     }
 
-    function testOnlyOneLiveProposalAtATime() public {
+    function testMembersCanCreateConcurrentProposals() public {
         vm.prank(memberA);
-        wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
+        uint256 idA = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
 
-        vm.expectRevert(TTASv3.ProposalStillActive.selector);
         vm.prank(memberB);
-        wallet.proposeDistribution(_addrs(memberA, memberB), _nums(70_000, 30_000));
+        uint256 idB = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(70_000, 30_000));
+
+        assertEq(uint256(wallet.proposalStatus(idA)), uint256(TTASv3.ProposalStatus.ACTIVE));
+        assertEq(uint256(wallet.proposalStatus(idB)), uint256(TTASv3.ProposalStatus.ACTIVE));
+
+        uint256[] memory liveIds = wallet.getLiveProposalIds();
+        assertEq(liveIds.length, 2);
+        assertEq(liveIds[0], idA);
+        assertEq(liveIds[1], idB);
+
+        // Concurrency is bounded: each member gets one live slot.
+        vm.expectRevert(TTASv3.ProposalStillActive.selector);
+        vm.prank(memberA);
+        wallet.proposeDistribution(_addrs(memberA, memberB), _nums(55_000, 45_000));
     }
 
-    function testPassedButUnexecutedProposalStillBlocksNewOnes() public {
+    function testPassedProposalBlocksOnlyItsProposer() public {
         vm.prank(memberA);
         uint256 id = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
         vm.prank(memberA);
@@ -52,6 +64,121 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         vm.expectRevert(TTASv3.ProposalStillActive.selector);
         vm.prank(memberA);
         wallet.proposeDistribution(_addrs(memberA, memberB), _nums(70_000, 30_000));
+
+        // Another member is not trapped behind A's proposal.
+        vm.prank(memberB);
+        uint256 concurrentId = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(70_000, 30_000));
+        assertEq(uint256(wallet.proposalStatus(concurrentId)), uint256(TTASv3.ProposalStatus.ACTIVE));
+    }
+
+    function testDistributionExecutionCancelsAllOtherLiveProposals() public {
+        MockERC20 op = new MockERC20("Optimism", "OP", 18);
+
+        vm.prank(memberA);
+        uint256 distributionId = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
+        vm.prank(memberB);
+        uint256 tokenId = wallet.proposeAddToken(address(op));
+
+        vm.prank(memberA);
+        wallet.vote(distributionId, true);
+        vm.prank(memberB);
+        wallet.vote(distributionId, true);
+        vm.prank(memberA);
+        wallet.vote(tokenId, true);
+        vm.prank(memberB);
+        wallet.vote(tokenId, true);
+
+        wallet.executeProposal(distributionId);
+
+        assertEq(uint256(wallet.proposalStatus(distributionId)), uint256(TTASv3.ProposalStatus.EXECUTED));
+        assertEq(uint256(wallet.proposalStatus(tokenId)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(wallet.getLiveProposalIds().length, 0);
+        assertFalse(wallet.isSupportedToken(address(op)));
+    }
+
+    function testAddTokenExecutionKeepsUnrelatedDistributionLive() public {
+        MockERC20 op = new MockERC20("Optimism", "OP", 18);
+
+        vm.prank(memberA);
+        uint256 tokenId = wallet.proposeAddToken(address(op));
+        vm.prank(memberB);
+        uint256 distributionId = wallet.proposeDistribution(_addrs(memberA, memberB), _nums(50_000, 50_000));
+
+        vm.prank(memberA);
+        wallet.vote(tokenId, true);
+        vm.prank(memberB);
+        wallet.vote(tokenId, true);
+        vm.prank(memberA);
+        wallet.vote(distributionId, true);
+        vm.prank(memberB);
+        wallet.vote(distributionId, true);
+
+        wallet.executeProposal(tokenId);
+
+        assertTrue(wallet.isSupportedToken(address(op)));
+        assertEq(uint256(wallet.proposalStatus(tokenId)), uint256(TTASv3.ProposalStatus.EXECUTED));
+        assertEq(uint256(wallet.proposalStatus(distributionId)), uint256(TTASv3.ProposalStatus.PASSED));
+
+        uint256[] memory liveIds = wallet.getLiveProposalIds();
+        assertEq(liveIds.length, 1);
+        assertEq(liveIds[0], distributionId);
+
+        wallet.executeProposal(distributionId);
+        assertEq(uint256(wallet.proposalStatus(distributionId)), uint256(TTASv3.ProposalStatus.EXECUTED));
+    }
+
+    function testDuplicateConcurrentTokenProposalIsCancelled() public {
+        MockERC20 op = new MockERC20("Optimism", "OP", 18);
+
+        vm.prank(memberA);
+        uint256 idA = wallet.proposeAddToken(address(op));
+        vm.prank(memberB);
+        uint256 idB = wallet.proposeAddToken(address(op));
+
+        vm.prank(memberA);
+        wallet.vote(idA, true);
+        vm.prank(memberB);
+        wallet.vote(idA, true);
+        vm.prank(memberA);
+        wallet.vote(idB, true);
+        vm.prank(memberB);
+        wallet.vote(idB, true);
+
+        wallet.executeProposal(idA);
+
+        assertEq(uint256(wallet.proposalStatus(idA)), uint256(TTASv3.ProposalStatus.EXECUTED));
+        assertEq(uint256(wallet.proposalStatus(idB)), uint256(TTASv3.ProposalStatus.CANCELLED));
+        assertEq(wallet.getTokens().length, 3);
+    }
+
+    function testReachingTokenCapCancelsOtherTokenProposals() public {
+        address[] memory tokens = new address[](9);
+        for (uint256 i = 0; i < 9; i++) {
+            tokens[i] = address(new MockERC20("T", "T", 18));
+        }
+        TTASv3 cappedWallet =
+            TTASv3(factory.createWallet(_addrs(memberA, memberB), _nums(SHARE_A, SHARE_B), tokens, SUPERMAJORITY));
+        MockERC20 opA = new MockERC20("A", "A", 18);
+        MockERC20 opB = new MockERC20("B", "B", 18);
+
+        vm.prank(memberA);
+        uint256 idA = cappedWallet.proposeAddToken(address(opA));
+        vm.prank(memberB);
+        uint256 idB = cappedWallet.proposeAddToken(address(opB));
+
+        vm.prank(memberA);
+        cappedWallet.vote(idA, true);
+        vm.prank(memberB);
+        cappedWallet.vote(idA, true);
+        vm.prank(memberA);
+        cappedWallet.vote(idB, true);
+        vm.prank(memberB);
+        cappedWallet.vote(idB, true);
+
+        cappedWallet.executeProposal(idA);
+
+        assertEq(cappedWallet.getTokens().length, 10);
+        assertEq(uint256(cappedWallet.proposalStatus(idB)), uint256(TTASv3.ProposalStatus.CANCELLED));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -156,12 +283,7 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
 
     function testUnanimityWallet() public {
         TTASv3 uWallet = TTASv3(
-            factory.createWallet(
-                _addrs(memberA, memberB),
-                _nums(SHARE_A, SHARE_B),
-                _addrs(address(dai)),
-                UNANIMITY
-            )
+            factory.createWallet(_addrs(memberA, memberB), _nums(SHARE_A, SHARE_B), _addrs(address(dai)), UNANIMITY)
         );
 
         vm.prank(memberA);
@@ -208,10 +330,7 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
     function testRemovedMemberKeepsEarningsAndStopsAccruing() public {
         TTASv3 threeWallet = TTASv3(
             factory.createWallet(
-                _addrs(memberA, memberB, memberC),
-                _nums(40_000, 30_000, 30_000),
-                _addrs(address(dai)),
-                SUPERMAJORITY
+                _addrs(memberA, memberB, memberC), _nums(40_000, 30_000, 30_000), _addrs(address(dai)), SUPERMAJORITY
             )
         );
         dai.mint(address(threeWallet), 1000e18); // earned while C is a member
@@ -303,6 +422,7 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
 
         TTASv3.ProposalView memory p = wallet.getProposal(id);
         assertEq(uint256(p.proposalType), uint256(TTASv3.ProposalType.DISTRIBUTION));
+        assertEq(p.proposer, memberA);
         assertEq(p.members.length, 2);
         assertEq(p.shares[0], 50_000);
         assertEq(p.votesFor, 60_000);

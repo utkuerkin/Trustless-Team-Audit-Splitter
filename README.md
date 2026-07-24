@@ -29,9 +29,14 @@ v3 uses MasterChef-style accumulator accounting instead of per-payment snapshots
 
 ```
 accPerShare[token]   cumulative tokens-per-share (scaled by 1e36)
-accrued(member)      = shares(member) * accPerShare - rewardDebt(member)
+grossScaled(member)  = shares(member) * accPerShare
+accrued(member)      = (grossScaled(member) - rewardDebt(member)) / 1e36
 new funds            = balanceOf(this) + totalReleased - totalAccounted
 ```
+
+`rewardDebt` is stored at accumulator precision. Subtraction happens before the
+single final division, so rounding at a share-table boundary cannot create more
+claimable tokens than the wallet owns.
 
 - **Receiving**: just send ERC20s to the wallet (or register it as the contest
   payout address). No action needed — funds are picked up lazily by `sync`.
@@ -40,12 +45,17 @@ new funds            = balanceOf(this) + totalReleased - totalAccounted
 - **Changing the team**: `proposeDistribution(members, shares)` proposes a complete
   new share table (sum = 100 000). Adding, removing, and re-weighting members are
   all the same operation — anyone omitted is removed. Proposals are validated at
-  creation, voted share-weighted, live for 7 days, one at a time, and executed by
-  anyone once the threshold is reached.
+  creation, voted share-weighted, live for 7 days, and executed by anyone once the
+  threshold is reached. Each member may have one live proposal, so up to 12 can
+  proceed concurrently without one minority member monopolizing a global slot.
+  Executing a distribution cancels every other live proposal because its recorded
+  vote weights belong to the old share table.
 - **Adding a token**: `proposeAddToken(token)` — same voting flow. Also rescues
-  funds a contest already paid in an unlisted token.
+  funds a contest already paid in an unlisted token. Duplicate concurrent token
+  proposals, and proposals left over when the 10-token cap is reached, are
+  cancelled automatically.
 - **Leaving**: `leave()` settles your earnings, redistributes your shares pro-rata
-  to the rest, and cancels any live proposal (its vote weights went stale).
+  to the rest, and cancels every live proposal (their vote weights went stale).
 
 ### Trust model — read before using
 
@@ -60,9 +70,23 @@ TTAS is a *trust-minimizing* tool for small teams, not a fully adversarial DAO:
   `100_000` = unanimity — nobody's share changes without consent, but one lost key
   deadlocks governance forever. A supermajority (e.g. `66_667`) is a sane default.
 - **Tokens**: designed for standard ERC20s (USDC, WETH, ...). Rebasing tokens are
-  unsupported. A whitelisted token that later breaks degrades gracefully (its
-  funds may freeze; everything else keeps working). Native ETH is not supported —
-  use WETH.
+  unsupported. An ordinary `balanceOf` revert from a whitelisted token is caught,
+  but isolation is not absolute: a hostile token can consume nearly all forwarded
+  gas or return arithmetic-extreme values and still block operations that sync
+  every token. Only whitelist vetted tokens. Native ETH is not supported — use
+  WETH.
+
+### Delayed and overlapping contest payouts
+
+Direct ERC20 transfers do not include a contest ID or payment epoch. TTAS must
+therefore split each payment using the share table in force **when the tokens
+arrive**, even if the payment belongs to an older contest.
+
+If Contest A may pay after the team has already adopted Contest B's split, use a
+fresh wallet clone for each contest or payout agreement. Clones are cheap, and
+separate addresses preserve the intended attribution without relying on payment
+timing. If one wallet is reused, do not change its shares until every earlier
+payment expected at that address has arrived.
 
 ## Repository layout
 
@@ -74,7 +98,7 @@ TTAS is a *trust-minimizing* tool for small teams, not a fully adversarial DAO:
 | `src/v1/`, `src/TTASFactory.sol` | v1: minimal fixed-share push splitter (legacy) |
 | `script/DeployV3.s.sol` | Deploys implementation + factory |
 | `script/CreateWallet.s.sol` | Creates a team wallet via env config |
-| `test/v3/` | 42 tests: accounting, governance, regressions, fuzz, gas stress |
+| `test/v3/` | Accounting, governance, regression, fuzz, and gas-stress tests |
 
 Version history: **v1** shipped as a static push-splitter (no governance, no
 snapshots). **v2-dev** (branch) attempted per-payment snapshots + voting but had
@@ -119,12 +143,15 @@ attack surface — accounting, governance, token/DoS, lifecycle — each finding
 verified by a skeptical second pass). All confirmed issues were fixed or are
 documented in the contract natspec as explicit design tradeoffs. Highlights:
 
-- Reverting/broken tokens cannot brick governance, exits, or other tokens'
-  claims (guarded `balanceOf`).
-- Rounding always favors the contract — the wallet cannot become insolvent;
-  dust is bounded to wei-level.
+- Ordinary reverting `balanceOf` calls are caught so a paused/broken token does
+  not automatically brick governance or exits. Gas-griefing and
+  arithmetic-extreme tokens remain explicitly unsupported.
+- Scaled reward debt performs subtraction before flooring, so share changes
+  cannot manufacture token-unit liabilities; rounding dust stays in the wallet.
 - Clones cannot be front-run initialized; `leave()` can never produce a
-  zero-share member; PASSED/DEFEATED states are mutually exclusive.
+  zero-share member; the wallet itself cannot be assigned membership; concurrent
+  proposals are bounded to one per member; PASSED/DEFEATED states are mutually
+  exclusive.
 
 This project is provided as is. It has **not** had a formal third-party audit —
 perform your own due diligence before trusting it with meaningful funds.
