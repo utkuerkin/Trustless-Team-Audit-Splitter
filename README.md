@@ -1,109 +1,218 @@
-# Trustless Team Audit Splitter (TTAS)
+# Trustless Team Audit Splitter
 
-A trustless, share-based team wallet for audit contest payouts. Register the wallet
-address as your team's payout address; earnings accrue to members pro-rata and are
-claimed pull-style. Membership and share changes go through share-weighted voting —
-and **money earned under the old share table is always settled at the old shares
-first**, so a member who joins later can never touch earlier payouts, and a member
-who leaves keeps everything they earned.
+Trustless Team Audit Splitter (TTAS) is a share-based wallet for distributing
+web3 audit contest payouts. A team registers the wallet as its payout address,
+and each member claims their allocation directly.
 
-## Why
+TTAS is intended for small, mutually identified audit teams. It removes the
+need for one member to receive and manually redistribute team funds. Membership
+and share changes use share-weighted voting.
 
-Team audits have a trust problem: someone's EOA receives the payout and everyone
-else hopes they split it fairly. TTAS replaces that person with a contract:
+## Project goals
 
-- 🔒 **Trustless distribution** — nobody custodies the funds; every member claims
-  their own share directly.
-- 📈 **Shares** — a beginner can join at a lower percentage; the table is changed
-  by vote, with the approval threshold your team chooses (majority → unanimity).
-- 📸 **Automatic snapshots** — any share change first settles everyone's accrued
-  earnings, so past money is locked to past shares. Joiners take nothing
-  retroactively; leavers lose nothing they earned.
-- 🚪 **Unilateral exit** — `leave()` lets any member walk away without permission,
-  with their earnings intact. Nobody can be trapped.
-- 💰 **Multi-token** — up to 10 ERC20 payment tokens per wallet, extensible by vote.
+- Distribute supported ERC20 payments without a custodial team account.
+- Allow each member to claim independently.
+- Preserve earnings accrued under an earlier share allocation.
+- Support governed membership and share changes.
+- Allow governance to retire a payment token without discarding existing claims.
+- Allow a member to leave without requiring a team vote.
+- Support up to 10 ERC20 payment tokens per wallet.
 
-## How it works (v3)
+## Accounting model
 
-v3 uses MasterChef-style accumulator accounting instead of per-payment snapshots:
+Version 3 uses accumulator-based accounting:
 
-```
-accPerShare[token]   cumulative tokens-per-share (scaled by 1e36)
-grossScaled(member)  = shares(member) * accPerShare
-accrued(member)      = (grossScaled(member) - rewardDebt(member)) / 1e36
-new funds            = balanceOf(this) + totalReleased - totalAccounted
+```text
+accPerShare[token]   cumulative tokens per share, scaled by 1e36
+grossScaled(member)  = shares(member) * accPerShare[token]
+accrued(member)      = (grossScaled(member) - rewardDebt(member, token)) / 1e36
+newFunds             = balanceOf(wallet) + totalReleased - totalAccounted
 ```
 
-`rewardDebt` is stored at accumulator precision. Subtraction happens before the
-single final division, so rounding at a share-table boundary cannot create more
-claimable tokens than the wallet owns.
+`rewardDebt` is stored at accumulator precision. Subtraction occurs before the
+final division, which prevents independent rounding operations across a share
+change from creating liabilities greater than the wallet balance.
 
-- **Receiving**: just send ERC20s to the wallet (or register it as the contest
-  payout address). No action needed — funds are picked up lazily by `sync`.
-- **Claiming**: `claim(token)` / `claimAll()` — O(1), pull-based, per member.
-  One member being blocklisted by a token can never freeze the others.
-- **Changing the team**: `proposeDistribution(members, shares)` proposes a complete
-  new share table (sum = 100 000). Adding, removing, and re-weighting members are
-  all the same operation — anyone omitted is removed. Proposals are validated at
-  creation, voted share-weighted, live for 7 days, and executed by anyone once the
-  threshold is reached. Each member may have one live proposal, so up to 12 can
-  proceed concurrently without one minority member monopolizing a global slot.
-  Executing a distribution cancels every other live proposal because its recorded
-  vote weights belong to the old share table.
-- **Adding a token**: `proposeAddToken(token)` — same voting flow. Also rescues
-  funds a contest already paid in an unlisted token. Duplicate concurrent token
-  proposals, and proposals left over when the 10-token cap is reached, are
-  cancelled automatically.
-- **Leaving**: `leave()` settles your earnings, redistributes your shares pro-rata
-  to the rest, and cancels every live proposal (their vote weights went stale).
+For standard, non-rebasing ERC20s, a share change first synchronizes every
+active token and settles each current member at the old shares. If any active
+token cannot be read, the complete share change reverts. This fail-closed rule
+prevents an existing balance from being reassigned under a newer share table.
 
-### Trust model — read before using
+New members receive a reward-debt baseline at the current accumulator and
+cannot claim funds accounted before they joined. Removed members retain their
+settled `owed` balances.
 
-TTAS is a *trust-minimizing* tool for small teams, not a fully adversarial DAO:
+Rounding is contract-favoring. A small amount of token base-unit dust can remain
+after a share epoch changes.
 
-- **Earned money is safe, future money is social.** Settled earnings (`owed`) are
-  claimable forever, even after removal. But a coalition holding the approval
-  threshold can rewrite the share table for future income. Your guaranteed
-  protections are: past earnings + `leave()`.
-- **Pick the threshold carefully** (set at wallet creation, immutable):
-  `50_001` = simple majority — most agile, but a majority holder rules the table.
-  `100_000` = unanimity — nobody's share changes without consent, but one lost key
-  deadlocks governance forever. A supermajority (e.g. `66_667`) is a sane default.
-- **Tokens**: designed for standard ERC20s (USDC, WETH, ...). Rebasing tokens are
-  unsupported. An ordinary `balanceOf` revert from a whitelisted token is caught,
-  but isolation is not absolute: a hostile token can consume nearly all forwarded
-  gas or return arithmetic-extreme values and still block operations that sync
-  every token. Only whitelist vetted tokens. Native ETH is not supported — use
-  WETH.
+## User operations
 
-### Delayed and overlapping contest payouts
+### Receive funds
 
-Direct ERC20 transfers do not include a contest ID or payment epoch. TTAS must
-therefore split each payment using the share table in force **when the tokens
-arrive**, even if the payment belongs to an older contest.
+Send a supported ERC20 to the wallet, or register the wallet as a contest payout
+address. Funds are recognized lazily by `sync`, `claim`, or a share change.
 
-If Contest A may pay after the team has already adopted Contest B's split, use a
-fresh wallet clone for each contest or payout agreement. Clones are cheap, and
-separate addresses preserve the intended attribution without relying on payment
-timing. If one wallet is reused, do not change its shares until every earlier
-payment expected at that address has arrived.
+### Claim funds
+
+- `claim(token)` claims one active, quarantined, or retired token.
+- `claimAll()` attempts to claim every active token in one transaction.
+
+If one token rejects a transfer, the complete `claimAll()` transaction reverts.
+Use `claim(token)` separately for the remaining tokens.
+
+Quarantined and retired tokens are not included in `claimAll()`. Claim them
+individually by address.
+
+### Change members or shares
+
+`proposeDistribution(members, shares)` proposes a complete replacement share
+table. Shares must sum to 100,000. Adding a member, removing a member, and
+changing allocations use the same proposal type.
+
+Each member may have one live proposal. Up to 12 proposals can therefore be
+active concurrently. Votes are weighted by current shares. A successful
+distribution change cancels every other live proposal because their recorded
+vote weights belong to the previous share table.
+
+Execution fails if any active token cannot provide a valid balance. The share
+table and proposal state remain unchanged. Remove or recover the affected token
+before executing the distribution again.
+
+### Add or remove a token
+
+`proposeAddToken(token)` proposes another supported payment token. The same
+share-weighted voting process applies. The token must provide a valid
+`balanceOf` response when proposed and when added. The wallet supports a maximum
+of 10 active tokens.
+
+An existing balance at the newly added token address becomes distributable
+after the token is added.
+
+`proposeRemoveToken(token)` proposes permanent removal from the active token
+set. Execution has two outcomes:
+
+- A readable token is synchronized, current accrual is moved to `owed`, and the
+  token becomes `RETIRED`.
+- An unreadable token is removed from active use and becomes `QUARANTINED`.
+  Current members and shares are frozen for that token.
+
+Once a quarantined token becomes readable, anyone may call
+`settleQuarantinedToken(token)`. Previously accounted claims are unchanged. Only
+the unaccounted balance is allocated using the frozen shares. Settlement is
+repeatable and the token remains `QUARANTINED`, so an early zero-value call
+cannot strand a delayed payout.
+
+Removal frees one active token slot. A quarantined or retired address cannot be
+added again because its earlier accounting remains stored.
+`getTokens()` returns active addresses only. Use `tokenState(token)` and emitted
+events to inspect a known historical token.
+
+### Leave
+
+`leave()` settles the caller's accrued balances, removes the caller from the
+member table, redistributes their shares proportionally among the remaining
+members, and cancels live proposals whose vote weights are no longer valid.
+
+The final member cannot leave because the wallet must retain a complete
+100,000-share allocation. Leaving also fails if an active token is unreadable.
+The team must recover or govern the removal of that token first.
+
+## Governance model
+
+The approval threshold is selected during wallet creation and cannot be
+changed:
+
+- `50,001` represents a simple majority.
+- `100,000` requires unanimity.
+- A threshold such as `66,667` provides a supermajority requirement.
+
+A coalition holding the approval threshold can replace the complete member and
+share table. Previously settled earnings remain claimable, but future income is
+governed by the new table. Team selection and threshold configuration therefore
+remain important trust assumptions.
+
+An unanimity threshold can permanently block governance if a member loses
+access to their key. A member can normally exit through `leave()`, but a broken
+active token makes removal governance necessary before any share change or
+exit. Use unanimity only when every key is expected to remain available.
+
+## Token compatibility and limitations
+
+TTAS is designed for standard, fixed-balance ERC20s such as USDC, USDT, DAI,
+and WETH.
+
+- Rebasing tokens are unsupported. A negative rebase can leave later claimants
+  underfunded.
+- Incoming fee-on-transfer tokens are accounted using the amount that reaches
+  the wallet. A token that deducts an additional fee from the sender, beyond the
+  requested transfer amount, is unsupported.
+- A member blocked by a token issuer cannot receive that token until the issuer
+  removes the block. Other members can still claim separately. If the wallet
+  address itself is blocked, all claims for that token can fail.
+- Native ETH is unsupported. Use WETH.
+- ERC20 transfer callbacks and other nonstandard transfer behavior are
+  unsupported.
+- `balanceOf` must complete within a 100,000 gas stipend and return exactly one
+  32-byte ABI word. Reverting, empty, short, or extra return data is treated as
+  unavailable.
+- Token addresses should still be reviewed before wallet creation or approval.
+
+### Token quarantine and incomplete isolation
+
+An unreadable active token cannot silently skip accounting. Operations that
+depend on its current balance revert with `TokenUnavailable`, including `sync`,
+`claim` for that token, `claimAll`, distribution execution, and `leave`.
+Individual claims for other readable tokens still work.
+
+Governance can remove the token while it is unreadable. Removal preserves
+already-accounted claims and freezes the current shares for funds that could not
+be measured. Share changes and `leave()` can continue after removal. Funds sent
+while the token is quarantined are also assigned using the frozen shares on the
+next settlement. Quarantine does not close after settlement, so later balances
+remain recoverable under the same frozen table.
+Already-accounted `owed` balances can still be claimed during quarantine if the
+token's transfer function works.
+
+Isolation remains incomplete in two important cases:
+
+- Removal still requires the configured governance threshold. Unanimity with a
+  lost key can therefore leave an unreadable token active indefinitely.
+- Quarantine cannot repair the token itself. Claims remain unavailable if its
+  transfer function is broken or the wallet is blocklisted.
+
+Do not send funds to a token after it becomes `RETIRED`. Retired tokens are
+permanently excluded from accounting, so later transfers to the wallet are
+stranded. A quarantined token remains recoverable, but every later transfer uses
+the shares frozen at removal.
+
+## Delayed and overlapping payouts
+
+Direct ERC20 transfers do not include a contest identifier or payment epoch.
+TTAS allocates a readable payment using the share table in effect when it is
+recognized. Distribution changes synchronize all active balances first, but a
+payment arriving after a completed change uses the newer table even if it
+belongs to an older contest.
+
+Use a separate wallet clone for each contest or payout agreement when payout
+timing can overlap. If one wallet is reused, do not change its shares until all
+payments expected under the earlier allocation have arrived and been
+synchronized.
 
 ## Repository layout
 
-| Path | What |
-|---|---|
-| `src/v3/TTASv3.sol` | **Current** wallet: accumulator accounting + governance |
-| `src/v3/TTASFactoryV3.sol` | Ownerless EIP-1167 clone factory (immutable implementation) |
-| `src/interfaces/ITTASv3.sol` | Initialization interface |
-| `src/v1/`, `src/TTASFactory.sol` | v1: minimal fixed-share push splitter (legacy) |
-| `script/DeployV3.s.sol` | Deploys implementation + factory |
-| `script/CreateWallet.s.sol` | Creates a team wallet via env config |
-| `test/v3/` | Accounting, governance, regression, fuzz, and gas-stress tests |
+| Path | Description |
+| --- | --- |
+| `src/v3/TTASv3.sol` | Current accumulator accounting and governance contract |
+| `src/v3/TTASFactoryV3.sol` | Ownerless EIP-1167 clone factory with an immutable implementation |
+| `src/interfaces/ITTASv3.sol` | Wallet initialization interface |
+| `src/v1/` and `src/TTASFactory.sol` | Legacy version 1 contracts |
+| `script/DeployV3.s.sol` | Deployment script for the implementation and factory |
+| `script/CreateWallet.s.sol` | Wallet creation script |
+| `test/v3/` | Version 3 unit, fuzz, regression, and gas tests |
 
-Version history: **v1** shipped as a static push-splitter (no governance, no
-snapshots). **v2-dev** (branch) attempted per-payment snapshots + voting but had
-fatal accounting flaws and was abandoned. **v3** is the rewrite: same goals,
-accumulator accounting, hardened governance.
+Version 1 used a fixed-share push distribution. The abandoned version 2
+development branch used per-payment snapshots. Version 3 replaces that design
+with accumulator accounting and pull-based claims.
 
 ## Development
 
@@ -112,77 +221,69 @@ forge build
 forge test
 ```
 
+The Foundry profile pins Solidity 0.8.34, the Paris EVM target, and 200-run
+optimization so deployment and verification use the same bytecode settings.
+
 ## Deployment
 
-Deploy the implementation + factory (one-shot; the factory has no owner):
+Deploy the version 3 implementation and factory:
 
 ```bash
 forge script script/DeployV3.s.sol \
   --rpc-url $RPC_URL --account <keystore-account> --broadcast --verify
 ```
 
-Create your team's wallet:
+Configure and create a wallet:
 
 ```bash
-export FACTORY=0x...                 # from the step above
-export MEMBERS=0xAlice,0xBob         # 1..12 unique addresses
-export SHARES=60000,40000            # sum must be exactly 100000
-export TOKENS=0xUSDC,0xWETH          # 1..10 payment tokens
-export THRESHOLD=66667               # 50001 (majority) .. 100000 (unanimity)
+export FACTORY=0x...
+export MEMBERS=0xAlice,0xBob
+export SHARES=60000,40000
+export TOKENS=0xUSDC,0xWETH
+export THRESHOLD=66667
 
 forge script script/CreateWallet.s.sol \
   --rpc-url $RPC_URL --account <keystore-account> --broadcast
 ```
 
-Then register the printed wallet address as your team's payout address.
+Register the resulting wallet address with the relevant payout provider.
 
-## Security
+## Security and testing
 
-v3 was reviewed with a multi-agent adversarial audit (independent reviewers per
-attack surface — accounting, governance, token/DoS, lifecycle — each finding
-verified by a skeptical second pass). All confirmed issues were fixed or are
-documented in the contract natspec as explicit design tradeoffs. Highlights:
+The version 3 suite includes unit tests, accounting regressions, fuzz tests,
+governance lifecycle tests, token quarantine tests, malformed-return tests, and
+a maximum-member and maximum-token gas test. The standard ERC20 accounting
+model has also been checked against a stateful reference model.
 
-- Ordinary reverting `balanceOf` calls are caught so a paused/broken token does
-  not automatically brick governance or exits. Gas-griefing and
-  arithmetic-extreme tokens remain explicitly unsupported.
-- Scaled reward debt performs subtraction before flooring, so share changes
-  cannot manufacture token-unit liabilities; rounding dust stays in the wallet.
-- Clones cannot be front-run initialized; `leave()` can never produce a
-  zero-share member; the wallet itself cannot be assigned membership; concurrent
-  proposals are bounded to one per member; PASSED/DEFEATED states are mutually
-  exclusive.
-
-This project is provided as is. It has **not** had a formal third-party audit —
-perform your own due diligence before trusting it with meaningful funds.
+The repository has not received a formal third-party audit. It should be
+treated as pre-release software until an independent review is completed.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major
-changes, please open an issue first to discuss what you would like to change.
-
-Please make sure to update tests as appropriate.
+Contributions are welcome through GitHub pull requests. Major behavioral
+changes should be discussed in an issue and include appropriate tests.
 
 ## Support
 
-If you find this project useful, consider supporting its development:
+EVM address:
 
-EVM Address: 0x526C34d58f50Bc2b610352f211841caDB7b20caA
+```text
+0x526C34d58f50Bc2b610352f211841caDB7b20caA
+```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is available under the MIT License. See [LICENSE](LICENSE).
 
 ## Attribution
 
-If you use this code in your project, please provide attribution:
 ```solidity
-// This code is derived from trustless-team-audit-splitter
-// Original work by ljjeth (https://github.com/utkuerkin/trustless-team-audit-splitter)
+// Derived from trustless-team-audit-splitter.
+// Original work by ljjeth: https://github.com/utkuerkin/trustless-team-audit-splitter
 ```
 
 ## Contact
 
 - GitHub: [@utkuerkin](https://github.com/utkuerkin)
-- Twitter/X: [@ljjeth](https://x.com/ljjeth)
-- Telegram: @utkuerkin
+- X: [@ljjeth](https://x.com/ljjeth)
+- Telegram: `@utkuerkin`

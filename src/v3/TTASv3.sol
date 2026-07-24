@@ -40,16 +40,15 @@ pragma solidity ^0.8.24;
 ///          the token's fee.
 ///        - rebasing: a negative rebase reads as zero new funds and can leave the
 ///          last claimers of that token short. Avoid rebasing tokens.
-///        - a token that later reverts in balanceOf: the revert is caught, so an
-///          ordinary pause/break does not freeze other tokens, governance or
-///          leave(). This isolation is not absolute: a hostile balanceOf can consume
-///          nearly all forwarded gas or return arithmetic-extreme values, which can
-///          still make operations that sync every token revert. Only whitelist
-///          vetted tokens. There is no token-removal path.
+///        - an unreadable active token makes share changes fail closed. Governance
+///          can remove it from the active set. Its accounted earnings remain
+///          claimable, while unaccounted funds are assigned later using the member
+///          shares frozen at removal.
 ///        - blocklist tokens (USDC-style): a member blocked by the token issuer
 ///          cannot receive that token; their balance in it is stranded (no admin
 ///          rescue exists). Their other tokens are unaffected.
-///      Native ETH is not supported — use WETH.
+///        - callback, rebasing and otherwise nonstandard tokens are unsupported.
+///      Native ETH is not supported; use WETH.
 ///
 ///      Payout attribution limitation. Direct ERC20 transfers carry no contest or
 ///      epoch identifier. A payment is therefore split using the share table in
@@ -63,9 +62,10 @@ pragma solidity ^0.8.24;
 ///        - A holder of >= threshold can rewrite the entire share table (including
 ///          handing 100% to a fresh address). Choose co-members accordingly.
 ///        - The threshold is immutable. Picking unanimity (100_000) means a single
-///          lost/dark key can deadlock all future membership changes; a member's
-///          only guaranteed escape is leave(). Prefer a supermajority over
-///          unanimity unless every member's key liveness is assured.
+///          lost/dark key can deadlock all future membership and token removals.
+///          leave() also requires every active token to be readable. Prefer a
+///          supermajority over unanimity unless every member's key liveness is
+///          assured.
 ///        - Each member may have at most one live proposal, so up to MAX_MEMBERS
 ///          proposals may proceed concurrently. This prevents one minority member
 ///          from monopolizing a global proposal slot. Any membership change cancels
@@ -75,6 +75,7 @@ pragma solidity ^0.8.24;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import "../interfaces/ITTASv3.sol";
 
 contract TTASv3 is ITTASv3, Initializable {
@@ -88,7 +89,20 @@ contract TTASv3 is ITTASv3, Initializable {
         // Replace the entire member/share table.
         DISTRIBUTION,
         // Whitelist an additional payment token.
-        ADD_TOKEN
+        ADD_TOKEN,
+        // Remove a payment token from the active set.
+        REMOVE_TOKEN
+    }
+
+    enum TokenState {
+        // The address has never been added.
+        UNSUPPORTED,
+        // Included in the active token list and accumulator accounting.
+        ACTIVE,
+        // Removed while unreadable; future balances use a frozen share table.
+        QUARANTINED,
+        // Removed while readable; future balances are not accounted.
+        RETIRED
     }
 
     enum ProposalStatus {
@@ -110,7 +124,7 @@ contract TTASv3 is ITTASv3, Initializable {
     struct Proposal {
         ProposalType proposalType;
         address proposer;
-        address token; // ADD_TOKEN proposals only
+        address token; // ADD_TOKEN and REMOVE_TOKEN proposals only
         address[] members; // DISTRIBUTION proposals only
         uint256[] shares; // DISTRIBUTION proposals only
         uint64 deadline;
@@ -153,6 +167,8 @@ contract TTASv3 is ITTASv3, Initializable {
     error DuplicateToken();
     error InvalidThreshold();
     error UnsupportedToken();
+    error TokenUnavailable(address token);
+    error TokenNotQuarantined();
     error NothingToClaim();
     error ProposalStillActive();
     error ProposalNotActive();
@@ -175,6 +191,7 @@ contract TTASv3 is ITTASv3, Initializable {
 
     uint256 private constant MAX_MEMBERS = 12;
     uint256 private constant MAX_TOKENS = 10;
+    uint256 private constant BALANCE_READ_GAS = 100_000;
 
     /// @notice Proposals must be voted through and executed within this window
     uint256 public constant VOTING_PERIOD = 7 days;
@@ -187,9 +204,17 @@ contract TTASv3 is ITTASv3, Initializable {
     mapping(address => uint256) private _shares;
     address[] private _memberList;
 
-    /// @notice Supported payment tokens
+    /// @notice True only while a payment token is active. Retained for ABI
+    ///         compatibility; use tokenState() to distinguish other states.
     mapping(address => bool) public isSupportedToken;
     address[] private _tokenList;
+    mapping(address => TokenState) public tokenState;
+
+    /// @dev Snapshot used only while a token is QUARANTINED. Strict synchronization
+    ///      before every share change guarantees that any unaccounted balance belongs
+    ///      to this frozen share epoch.
+    mapping(address => address[]) private _quarantineMembers;
+    mapping(address => uint256[]) private _quarantineShares;
 
     // Accumulator accounting, per token (see contract-level natspec).
     mapping(address => uint256) public accPerShare;
@@ -226,6 +251,9 @@ contract TTASv3 is ITTASv3, Initializable {
     event SharesSet(address indexed member, uint256 shares);
     event MemberLeft(address indexed member);
     event TokenAdded(address indexed token);
+    event TokenQuarantined(address indexed token);
+    event TokenRetired(address indexed token);
+    event QuarantinedFundsSettled(address indexed token, uint256 newFunds);
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -286,28 +314,39 @@ contract TTASv3 is ITTASv3, Initializable {
 
     /// @notice Accrues any funds received since the last sync into the accumulator.
     ///         Permissionless; called automatically by claim() and on share changes.
-    function sync(address token) public {
-        if (!isSupportedToken[token]) revert UnsupportedToken();
-        _sync(token);
+    function sync(address token) external {
+        if (tokenState[token] != TokenState.ACTIVE) revert UnsupportedToken();
+        _syncStrict(token);
     }
 
     /// @notice Claims everything msg.sender is owed in `token` (settled + accrued).
-    ///         Also callable by former members to collect their settled balance.
+    ///         Also callable by former members and for quarantined or retired tokens.
     function claim(address token) external returns (uint256 amount) {
-        if (!isSupportedToken[token]) revert UnsupportedToken();
-        _sync(token);
-        amount = _harvest(msg.sender, token);
+        TokenState state = tokenState[token];
+        if (state == TokenState.UNSUPPORTED) revert UnsupportedToken();
+
+        if (state == TokenState.ACTIVE) {
+            _syncStrict(token);
+            amount = _harvest(msg.sender, token);
+        } else {
+            amount = owed[msg.sender][token];
+            if (amount > 0) {
+                owed[msg.sender][token] = 0;
+            }
+        }
+
         if (amount == 0) revert NothingToClaim();
         _payout(token, msg.sender, amount);
     }
 
-    /// @notice Claims everything msg.sender is owed across all supported tokens.
+    /// @notice Claims everything msg.sender is owed across all active tokens.
     /// @dev Convenience wrapper: if any single transfer reverts (e.g. the caller is
     ///      blocklisted by one token), use claim(token) for the others instead.
+    ///      Quarantined and retired tokens must be claimed individually.
     function claimAll() external returns (uint256 totalClaimed) {
         for (uint256 i = 0; i < _tokenList.length; i++) {
             address token = _tokenList[i];
-            _sync(token);
+            _syncStrict(token);
             uint256 amount = _harvest(msg.sender, token);
             if (amount > 0) {
                 _payout(token, msg.sender, amount);
@@ -343,9 +382,21 @@ contract TTASv3 is ITTASv3, Initializable {
     ///      force when the proposal executes, since arrival time is unknowable.
     function proposeAddToken(address token) external onlyMember returns (uint256 proposalId) {
         if (token == address(0)) revert ZeroAddress();
-        if (isSupportedToken[token]) revert DuplicateToken();
+        if (tokenState[token] != TokenState.UNSUPPORTED) revert DuplicateToken();
         if (_tokenList.length >= MAX_TOKENS) revert TooManyTokens();
+        (bool available,) = _readBalance(token);
+        if (!available) revert TokenUnavailable(token);
         proposalId = _createProposal(ProposalType.ADD_TOKEN);
+        _proposals[proposalId].token = token;
+    }
+
+    /// @notice Proposes permanently removing a token from the active token set.
+    /// @dev A readable token is synchronized and retired immediately on execution.
+    ///      An unreadable token is quarantined with the current share table frozen
+    ///      for later settlement. Removed token addresses cannot be added again.
+    function proposeRemoveToken(address token) external onlyMember returns (uint256 proposalId) {
+        if (tokenState[token] != TokenState.ACTIVE) revert UnsupportedToken();
+        proposalId = _createProposal(ProposalType.REMOVE_TOKEN);
         _proposals[proposalId].token = token;
     }
 
@@ -380,12 +431,42 @@ contract TTASv3 is ITTASv3, Initializable {
             // every other live proposal used the old vote weights and is cancelled.
             _cancelAllLiveProposals();
             _applyDistribution(p.members, p.shares);
-        } else {
+        } else if (p.proposalType == ProposalType.ADD_TOKEN) {
             _addToken(p.token);
             _clearProposalSlot(p.proposer, proposalId);
-            _cancelInvalidTokenProposals(p.token);
+            _cancelInvalidAddTokenProposals(p.token);
+        } else {
+            _removeToken(p.token);
+            _clearProposalSlot(p.proposer, proposalId);
+            _cancelInvalidRemoveTokenProposals(p.token);
         }
         emit ProposalExecuted(proposalId);
+    }
+
+    /// @notice Accounts for funds held by a quarantined token once balanceOf works
+    ///         again, using the member shares frozen when the token was removed.
+    /// @dev Permissionless and repeatable. Already-accounted owed balances are not
+    ///      redistributed. The token stays quarantined so later funds cannot be
+    ///      stranded by an early third-party settlement.
+    function settleQuarantinedToken(address token) external returns (uint256 newFunds) {
+        if (tokenState[token] != TokenState.QUARANTINED) revert TokenNotQuarantined();
+
+        (bool available, uint256 funds) = _newFunds(token);
+        if (!available) revert TokenUnavailable(token);
+        newFunds = funds;
+
+        address[] storage members = _quarantineMembers[token];
+        uint256[] storage frozenShares = _quarantineShares[token];
+        for (uint256 i = 0; i < members.length; i++) {
+            uint256 amount = _proRata(newFunds, frozenShares[i]);
+            if (amount > 0) {
+                owed[members[i]][token] += amount;
+            }
+        }
+
+        totalAccounted[token] += newFunds;
+
+        emit QuarantinedFundsSettled(token, newFunds);
     }
 
     /// @notice Leaves the team unilaterally. The caller's accrued earnings are
@@ -442,15 +523,33 @@ contract TTASv3 is ITTASv3, Initializable {
         return _tokenList;
     }
 
+    /// @notice Frozen member table for an unreadable token removed from active use.
+    function getQuarantineSnapshot(address token)
+        external
+        view
+        returns (address[] memory members, uint256[] memory frozenShares)
+    {
+        return (_quarantineMembers[token], _quarantineShares[token]);
+    }
+
     /// @notice Everything `account` could claim in `token` right now, including
-    ///         funds received but not yet synced.
+    ///         funds received but not yet synced for an active token. Quarantined
+    ///         funds become visible only after settleQuarantinedToken().
     function claimable(address account, address token) external view returns (uint256) {
-        if (!isSupportedToken[token]) revert UnsupportedToken();
+        TokenState state = tokenState[token];
+        if (state == TokenState.UNSUPPORTED) revert UnsupportedToken();
+        if (state != TokenState.ACTIVE) return owed[account][token];
+
         uint256 acc = accPerShare[token];
-        uint256 newFunds = _newFunds(token);
+        (bool available, uint256 newFunds) = _newFunds(token);
+        if (!available) revert TokenUnavailable(token);
         if (newFunds > 0) {
-            acc += (newFunds * ACC_PRECISION) / MAX_TOTAL_SHARES;
+            if (newFunds > type(uint256).max / ACC_PRECISION) revert TokenUnavailable(token);
+            uint256 increment = (newFunds * ACC_PRECISION) / MAX_TOTAL_SHARES;
+            if (increment > type(uint256).max - acc) revert TokenUnavailable(token);
+            acc += increment;
         }
+        if (acc > type(uint256).max / MAX_TOTAL_SHARES) revert TokenUnavailable(token);
         uint256 grossScaled = _shares[account] * acc;
         uint256 debt = rewardDebt[account][token];
         uint256 accrued = grossScaled > debt ? (grossScaled - debt) / ACC_PRECISION : 0;
@@ -518,33 +617,64 @@ contract TTASv3 is ITTASv3, Initializable {
                           INTERNAL: ACCOUNTING
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Funds received since the last sync. Hardened against two common failures:
-    ///      - A balance DROP (rebasing/deflationary token) reads as zero new funds
-    ///        instead of underflow-reverting (which is what bricked v2).
-    ///      - A balanceOf that REVERTS (a token later paused, upgraded to revert, or
-    ///        pointed at a self-destructed impl) reads as zero new funds instead of
-    ///        propagating. Because sync() runs over every token inside
-    ///        _applyDistribution, leave() and claimAll(), an unguarded ordinary
-    ///        revert here would freeze membership changes and exits.
-    ///      This is deliberately not described as complete malicious-token isolation:
-    ///      the external call has no gas cap, and arithmetic-extreme successful
-    ///      return values can still revert inside this function or _sync().
-    function _newFunds(address token) private view returns (uint256) {
-        try IERC20(token).balanceOf(address(this)) returns (uint256 bal) {
-            uint256 totalIn = bal + totalReleased[token];
-            uint256 accounted = totalAccounted[token];
-            return totalIn > accounted ? totalIn - accounted : 0;
-        } catch {
-            return 0;
+    /// @dev Reads balanceOf with bounded gas and validates the exact ABI shape.
+    ///      Typed try/catch cannot catch a successful call whose return data fails
+    ///      decoding. A fixed-size assembly output buffer also avoids copying
+    ///      oversized return data into memory.
+    function _readBalance(address token) private view returns (bool available, uint256 tokenBalance) {
+        uint256 gasLimit = BALANCE_READ_GAS;
+        uint256 balanceOfSelector = uint32(IERC20.balanceOf.selector);
+        assembly ("memory-safe") {
+            // balanceOf(address) selector followed by this wallet's address.
+            mstore(0x00, shl(224, balanceOfSelector))
+            mstore(0x04, address())
+            let success := staticcall(gasLimit, token, 0x00, 0x24, 0x00, 0x20)
+            available := and(success, eq(returndatasize(), 0x20))
+            if available { tokenBalance := mload(0x00) }
         }
     }
 
-    function _sync(address token) private {
-        uint256 newFunds = _newFunds(token);
-        if (newFunds == 0) return;
-        accPerShare[token] += (newFunds * ACC_PRECISION) / MAX_TOTAL_SHARES;
-        totalAccounted[token] += newFunds;
+    /// @dev Funds received since the last sync. A balance drop from a rebasing or
+    ///      otherwise deflationary token is treated as zero new funds. Unreadable,
+    ///      malformed and arithmetic-extreme responses are reported as unavailable.
+    function _newFunds(address token) private view returns (bool available, uint256 newFunds) {
+        (bool readable, uint256 balance) = _readBalance(token);
+        if (!readable) return (false, 0);
+
+        uint256 released = totalReleased[token];
+        if (balance > type(uint256).max - released) return (false, 0);
+
+        uint256 totalIn = balance + released;
+        uint256 accounted = totalAccounted[token];
+        return (true, totalIn > accounted ? totalIn - accounted : 0);
+    }
+
+    /// @dev Attempts to synchronize without reverting when the token is unavailable.
+    ///      No state is written unless every arithmetic operation is representable.
+    function _trySync(address token) private returns (bool) {
+        (bool available, uint256 newFunds) = _newFunds(token);
+        if (!available) return false;
+        if (newFunds == 0) return true;
+        if (newFunds > type(uint256).max / ACC_PRECISION) return false;
+
+        uint256 increment = (newFunds * ACC_PRECISION) / MAX_TOTAL_SHARES;
+        uint256 currentAcc = accPerShare[token];
+        uint256 accounted = totalAccounted[token];
+        if (increment > type(uint256).max - currentAcc || newFunds > type(uint256).max - accounted) {
+            return false;
+        }
+
+        uint256 nextAcc = currentAcc + increment;
+        if (nextAcc > type(uint256).max / MAX_TOTAL_SHARES) return false;
+
+        accPerShare[token] = nextAcc;
+        totalAccounted[token] = accounted + newFunds;
         emit Synced(token, newFunds);
+        return true;
+    }
+
+    function _syncStrict(address token) private {
+        if (!_trySync(token)) revert TokenUnavailable(token);
     }
 
     /// @dev Accumulator earnings of `account` in `token` since their last settlement.
@@ -583,7 +713,7 @@ contract TTASv3 is ITTASv3, Initializable {
 
         // 1. Sync all tokens so unsynced funds accrue at the OLD shares.
         for (uint256 i = 0; i < tokenCount; i++) {
-            _sync(_tokenList[i]);
+            _syncStrict(_tokenList[i]);
         }
 
         // 2. Settle every current member's whole-token accrued earnings into `owed`,
@@ -619,6 +749,59 @@ contract TTASv3 is ITTASv3, Initializable {
             }
             emit SharesSet(member, share);
         }
+    }
+
+    /// @dev Removes an active token. A readable token is first synchronized and
+    ///      retired. If it is unavailable, already-accounted accrual is preserved
+    ///      and the current share table is frozen for its unaccounted balance.
+    function _removeToken(address token) private {
+        if (tokenState[token] != TokenState.ACTIVE) revert UnsupportedToken();
+
+        bool synchronized = _trySync(token);
+        uint256 memberCount = _memberList.length;
+
+        for (uint256 i = 0; i < memberCount; i++) {
+            address member = _memberList[i];
+            uint256 accrued = _accrued(member, token);
+            if (accrued > 0) {
+                owed[member][token] += accrued;
+            }
+            rewardDebt[member][token] = 0;
+
+            if (!synchronized) {
+                _quarantineMembers[token].push(member);
+                _quarantineShares[token].push(_shares[member]);
+            }
+        }
+
+        _removeActiveToken(token);
+        isSupportedToken[token] = false;
+
+        if (synchronized) {
+            tokenState[token] = TokenState.RETIRED;
+            emit TokenRetired(token);
+        } else {
+            tokenState[token] = TokenState.QUARANTINED;
+            emit TokenQuarantined(token);
+        }
+    }
+
+    function _removeActiveToken(address token) private {
+        uint256 tokenCount = _tokenList.length;
+        for (uint256 i = 0; i < tokenCount; i++) {
+            if (_tokenList[i] != token) continue;
+            if (i != tokenCount - 1) {
+                _tokenList[i] = _tokenList[tokenCount - 1];
+            }
+            _tokenList.pop();
+            return;
+        }
+        revert UnsupportedToken();
+    }
+
+    /// @dev Overflow-safe floor(amount * share / MAX_TOTAL_SHARES).
+    function _proRata(uint256 amount, uint256 share) private pure returns (uint256) {
+        return Math.mulDiv(amount, share, MAX_TOTAL_SHARES);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -662,7 +845,7 @@ contract TTASv3 is ITTASv3, Initializable {
 
     /// @dev Adding a token invalidates concurrent proposals for the same token.
     ///      Reaching MAX_TOKENS invalidates every remaining ADD_TOKEN proposal.
-    function _cancelInvalidTokenProposals(address addedToken) private {
+    function _cancelInvalidAddTokenProposals(address addedToken) private {
         bool tokenListFull = _tokenList.length >= MAX_TOKENS;
         uint256 memberCount = _memberList.length;
         for (uint256 i = 0; i < memberCount; i++) {
@@ -672,6 +855,27 @@ contract TTASv3 is ITTASv3, Initializable {
             uint256 proposalId = plusOne - 1;
             Proposal storage candidate = _proposals[proposalId];
             if (candidate.proposalType == ProposalType.ADD_TOKEN && (candidate.token == addedToken || tokenListFull)) {
+                ProposalStatus status = proposalStatus(proposalId);
+                if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
+                    candidate.cancelled = true;
+                    emit ProposalCancelled(proposalId);
+                }
+                delete _liveProposalPlusOne[proposer];
+            }
+        }
+    }
+
+    /// @dev Removing a token invalidates concurrent removal proposals for the same
+    ///      address without disturbing proposals for distributions or other tokens.
+    function _cancelInvalidRemoveTokenProposals(address removedToken) private {
+        uint256 memberCount = _memberList.length;
+        for (uint256 i = 0; i < memberCount; i++) {
+            address proposer = _memberList[i];
+            uint256 plusOne = _liveProposalPlusOne[proposer];
+            if (plusOne == 0) continue;
+            uint256 proposalId = plusOne - 1;
+            Proposal storage candidate = _proposals[proposalId];
+            if (candidate.proposalType == ProposalType.REMOVE_TOKEN && candidate.token == removedToken) {
                 ProposalStatus status = proposalStatus(proposalId);
                 if (status == ProposalStatus.ACTIVE || status == ProposalStatus.PASSED) {
                     candidate.cancelled = true;
@@ -694,8 +898,12 @@ contract TTASv3 is ITTASv3, Initializable {
 
     function _addToken(address token) private {
         if (token == address(0)) revert ZeroAddress();
-        if (isSupportedToken[token]) revert DuplicateToken();
+        if (tokenState[token] != TokenState.UNSUPPORTED) revert DuplicateToken();
         if (_tokenList.length >= MAX_TOKENS) revert TooManyTokens();
+        (bool available,) = _readBalance(token);
+        if (!available) revert TokenUnavailable(token);
+
+        tokenState[token] = TokenState.ACTIVE;
         isSupportedToken[token] = true;
         _tokenList.push(token);
         emit TokenAdded(token);

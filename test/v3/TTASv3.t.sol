@@ -29,6 +29,9 @@ contract TTASv3Test is TTASv3TestBase {
         assertEq(tokens.length, 2);
         assertTrue(wallet.isSupportedToken(address(dai)));
         assertTrue(wallet.isSupportedToken(address(usdc)));
+        assertEq(uint256(wallet.tokenState(address(dai))), uint256(TTASv3.TokenState.ACTIVE));
+        assertEq(uint256(wallet.tokenState(address(usdc))), uint256(TTASv3.TokenState.ACTIVE));
+        assertEq(uint256(wallet.tokenState(address(0xdead))), uint256(TTASv3.TokenState.UNSUPPORTED));
 
         assertEq(factory.walletCount(), 1);
         assertEq(factory.getDeployedWallets()[0], address(wallet));
@@ -99,6 +102,9 @@ contract TTASv3Test is TTASv3TestBase {
 
         vm.expectRevert(TTASv3.ZeroAddress.selector);
         factory.createWallet(_addrs(memberA), _nums(100_000), _addrs(address(0)), UNANIMITY);
+
+        vm.expectRevert(abi.encodeWithSelector(TTASv3.TokenUnavailable.selector, address(0xdead)));
+        factory.createWallet(_addrs(memberA), _nums(100_000), _addrs(address(0xdead)), UNANIMITY);
 
         // Threshold must be a strict majority at minimum, unanimity at maximum.
         vm.expectRevert(TTASv3.InvalidThreshold.selector);

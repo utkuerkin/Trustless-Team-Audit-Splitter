@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {TTASv3TestBase} from "./TTASv3TestBase.sol";
 import {TTASv3} from "../../src/v3/TTASv3.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
+import {BreakableERC20} from "../mocks/BreakableERC20.sol";
 
 contract TTASv3GovernanceTest is TTASv3TestBase {
     /*//////////////////////////////////////////////////////////////
@@ -18,6 +19,10 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         vm.expectRevert(TTASv3.NotMember.selector);
         vm.prank(outsider);
         wallet.proposeAddToken(address(0xdead));
+
+        vm.expectRevert(TTASv3.NotMember.selector);
+        vm.prank(outsider);
+        wallet.proposeRemoveToken(address(dai));
     }
 
     function testProposalTableIsValidatedAtCreation() public {
@@ -149,6 +154,22 @@ contract TTASv3GovernanceTest is TTASv3TestBase {
         assertEq(uint256(wallet.proposalStatus(idA)), uint256(TTASv3.ProposalStatus.EXECUTED));
         assertEq(uint256(wallet.proposalStatus(idB)), uint256(TTASv3.ProposalStatus.CANCELLED));
         assertEq(wallet.getTokens().length, 3);
+    }
+
+    function testTokenProposalValidationUsesLifecycleAndReadableBalance() public {
+        vm.expectRevert(TTASv3.UnsupportedToken.selector);
+        vm.prank(memberA);
+        wallet.proposeRemoveToken(address(0xdead));
+
+        vm.expectRevert(abi.encodeWithSelector(TTASv3.TokenUnavailable.selector, address(0xdead)));
+        vm.prank(memberA);
+        wallet.proposeAddToken(address(0xdead));
+
+        BreakableERC20 malformed = new BreakableERC20();
+        malformed.setMalformed(true);
+        vm.expectRevert(abi.encodeWithSelector(TTASv3.TokenUnavailable.selector, address(malformed)));
+        vm.prank(memberA);
+        wallet.proposeAddToken(address(malformed));
     }
 
     function testReachingTokenCapCancelsOtherTokenProposals() public {
