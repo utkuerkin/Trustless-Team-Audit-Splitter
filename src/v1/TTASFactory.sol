@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @title Trustless Team Audit Splitter Factory
+/// @title Trustless Team Audit Splitter Factory v1
 /// @author ljjeth (https://github.com/utkuerkin)
-/// @notice Factory contract for deploying new TTAS instances
-/// @dev Original work: https://github.com/utkuerkin/trustless-team-audit-splitter
+/// @notice Legacy factory for deploying TTASv1 instances.
+/// @dev Retained as a historical artifact. New deployments should use TTASFactoryV3.
+///      Original work: https://github.com/utkuerkin/trustless-team-audit-splitter
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/proxy/Clones.sol";
-import "./interfaces/ITTAS.sol";
+import "../interfaces/ITTAS.sol";
 
 contract TTASFactory is Ownable {
     using Clones for address;
@@ -149,4 +150,4 @@ contract TTASFactory is Ownable {
     function getDefaultTokens() external view returns (address[] memory) {
         return defaultTokens;
     }
-}    
+}

@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {TTASv1} from "../../src/v1/TTASv1.sol";
-import {TTASFactory} from "../../src/TTASFactory.sol";
+import {TTASFactory} from "../../src/v1/TTASFactory.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {MockTTASv2} from "../mocks/MockTTASv2.sol";

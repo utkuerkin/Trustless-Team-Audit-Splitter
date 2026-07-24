@@ -205,7 +205,7 @@ synchronized.
 | `src/v3/TTASv3.sol` | Current accumulator accounting and governance contract |
 | `src/v3/TTASFactoryV3.sol` | Ownerless EIP-1167 clone factory with an immutable implementation |
 | `src/interfaces/ITTASv3.sol` | Wallet initialization interface |
-| `src/v1/` and `src/TTASFactory.sol` | Legacy version 1 contracts |
+| `src/v1/` | Legacy version 1 wallet and factory |
 | `script/DeployV3.s.sol` | Deployment script for the implementation and factory |
 | `script/CreateWallet.s.sol` | Wallet creation script |
 | `test/v3/` | Version 3 unit, fuzz, regression, and gas tests |
